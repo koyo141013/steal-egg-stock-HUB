@@ -1,6 +1,11 @@
--- Steal an Egg : Stock / ESP / TP / Auto-Steal v1
+-- Steal an Egg : Stock / ESP / TP / Auto-Steal v1.5
 -- PlaceId 107778070777162 전용
 -- RightShift = 창 열기/닫기
+-- v1.1: 장거리 TP 실패 수정 (스트리밍 요청 + 단계별 이동 + 다중 스냅 + 모션 제거)
+-- v1.2: TP 후 원위치 되돌림(서버 RigSync Correction) 수정 (앵커 고정 + 홀드 + 재시도)
+-- v1.3: TP 중 사망 수정 (전구간 앵커 + 바닥확인 + 실패시 출발지 복귀)
+-- v1.4: 자동스틸 귀환 (알 줍기 감지 → 내 기지로 TP)
+-- v1.5: 스틸 시퀀스 단순화 (알 TP → E 3초 홀드 → 기지 귀환), 오감지/TP충돌 수정
 
 if getgenv().StealEggStock_Loaded then
     pcall(function() getgenv().StealEggStock_Cleanup() end)
@@ -15,6 +20,7 @@ local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local StarterGui = cloneref(game:GetService("StarterGui"))
 local CoreGui = cloneref(game:GetService("CoreGui"))
 local UserInputService = cloneref(game:GetService("UserInputService"))
+local RunService = cloneref(game:GetService("RunService"))
 
 local LocalPlayer = Players.LocalPlayer
 if game.PlaceId ~= 107778070777162 then
@@ -32,6 +38,16 @@ getgenv().StealEggConfig = getgenv().StealEggConfig or {
     AutoSteal = false,
     NotifyRare = true,
     NotifyRank = 6, -- 이 Rank 이상 뜨면 알림 (Mythic/Rainbow=6, Secret=8 등)
+    TPStep = 450, -- 장거리 TP 시 한 번에 이동할 최대 스터드 (작을수록 안정적, 느림)
+    TPTimeout = 15, -- 한 번 TP에 쓸 최대 시간(초)
+    TPTolerance = 15, -- 목표 도착 판정 거리(스터드)
+    TPHold = 1.5, -- 도착 후 앵커 고정으로 서버 되돌림 버티는 시간(초)
+    TPRetry = 3, -- 되돌려지면 다시 시도할 최대 횟수
+    TPAlt = 10, -- 목표 위 공중 높이(스터드, 지형 겹침 방지)
+    TPGroundWait = 3, -- 해제 전 바닥 로딩 대기(초)
+    TPSafeReturn = true, -- 바닥 없으면 출발지로 복귀
+    AutoFireE = true, -- 자동스틸: 알 앞에 가면 E(줍기 프롬프트) 자동발동 시도
+    CarryTimeout = 25, -- 알 앞에서 E 대기 시간(초)
 }
 local Config = getgenv().StealEggConfig
 
@@ -121,16 +137,246 @@ local function GetHRP()
     return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
 
-local function TeleportTo(cf)
-    local hrp = GetHRP()
-    if not hrp or not cf then return false end
-    local target = cf + Vector3.new(0, 6, 0)
+local function ZeroMotion(hrp)
+    pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+    pcall(function() hrp.AssemblyAngularVelocity = Vector3.zero end)
+    -- 구버전 호환
+    pcall(function() hrp.Velocity = Vector3.zero end)
+    pcall(function() hrp.RotVelocity = Vector3.zero end)
+end
+
+local function HardSet(hrp, cframe)
+    pcall(function() hrp.CFrame = cframe end)
     pcall(function()
-        hrp.CFrame = CFrame.new(target.Position, target.Position + Vector3.new(0, 0, 1))
-        hrp.Velocity = Vector3.zero
-        hrp.RotVelocity = Vector3.zero
+        local char = LocalPlayer.Character
+        if char then char:PivotTo(cframe) end
     end)
-    return true
+    ZeroMotion(hrp)
+end
+
+-- v1.3 장거리 TP + 서버 되돌림(RigSync Correction) + 사망 방지:
+-- 전구간 앵커(추락사 차단) + 바닥확인 + 실패시 출발지 복귀 + 재시도
+-- 반환: success(bool), dist(number), msg(string)
+local function SetCharCollide(char, collide)
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then
+            pcall(function()
+                if collide then
+                    p.CanCollide = (p.Name ~= "Head")
+                else
+                    p.CanCollide = false
+                end
+            end)
+        end
+    end
+end
+
+local function HasGroundBelow(pos, char)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { char }
+    params.IgnoreWater = false
+    local ok, hit = pcall(function()
+        return Workspace:Raycast(pos, Vector3.new(0, -60, 0), params)
+    end)
+    return ok and hit ~= nil
+end
+
+local function RestoreChar(char, hrp, hum)
+    pcall(function() hrp.Anchored = false end)
+    SetCharCollide(char, true)
+    pcall(function()
+        hum.PlatformStand = false
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end)
+end
+
+local TPBusy = false
+local function TeleportToInner(cf, opts)
+    opts = opts or {}
+    local hrp = GetHRP()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid") or nil
+    if not hrp or not cf or typeof(cf) ~= "CFrame" then return false, math.huge, "좌표/HRP 없음" end
+    if not hum or hum.Health <= 0 then return false, math.huge, "캐릭터 사망 상태" end
+
+    local step = tonumber(opts.step or Config.TPStep) or 450
+    if step < 100 then step = 100 end
+    if step > 2000 then step = 2000 end
+    local timeout = tonumber(opts.timeout or Config.TPTimeout) or 15
+    local tolerance = tonumber(opts.tolerance or Config.TPTolerance) or 15
+    local holdTime = tonumber(opts.hold or Config.TPHold) or 1.5
+    local maxRetry = tonumber(opts.retry or Config.TPRetry) or 3
+    local alt = tonumber(opts.alt or Config.TPAlt) or 10
+    local groundWait = tonumber(opts.groundWait or Config.TPGroundWait) or 3
+    local safeReturn = (opts.safeReturn == nil) and (Config.TPSafeReturn ~= false) or opts.safeReturn
+
+    local startCF = hrp.CFrame
+    local targetPos = cf.Position + Vector3.new(0, alt, 0)
+    local targetCF = CFrame.new(targetPos)
+
+    -- 사망 감지 (이동 중 죽으면 즉시 실패 처리)
+    local died = false
+    local diedConn
+    pcall(function()
+        diedConn = hum.Died:Connect(function() died = true end)
+    end)
+
+    local function cleanupConn()
+        pcall(function() if diedConn then diedConn:Disconnect() end end)
+    end
+
+    for attempt = 1, math.max(1, maxRetry) do
+        if not getgenv().StealEggStock_Loaded then cleanupConn() return false, math.huge, "언로드됨" end
+        hrp = GetHRP()
+        char = LocalPlayer.Character
+        hum = char and char:FindFirstChildOfClass("Humanoid") or nil
+        if died or not hrp or not hum or hum.Health <= 0 then
+            cleanupConn()
+            return false, math.huge, "이동 중 사망/리스폰됨"
+        end
+
+        -- 1) 충돌 OFF + 즉시 앵커 (이 시점부터 추락 불가)
+        pcall(function()
+            hum.Sit = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end)
+        SetCharCollide(char, false)
+        pcall(function() hum.PlatformStand = true end)
+        pcall(function() hrp.Anchored = true end)
+        HardSet(hrp, hrp.CFrame)
+        -- 2) 목표 지점 스트리밍 요청 (앵커 상태라 떨어지지 않음)
+        pcall(function()
+            LocalPlayer:RequestStreamAroundAsync(targetPos, 3)
+        end)
+        task.wait(0.2)
+
+        local t0 = os.clock()
+        -- 3) 앵커 상태로 단계별 이동 (빈 청크 통과해도 추락사 없음)
+        local aborted = false
+        while getgenv().StealEggStock_Loaded and not died do
+            if not hrp.Parent then aborted = true break end
+            if os.clock() - t0 > timeout then break end
+            local dist = (hrp.Position - targetPos).Magnitude
+            if dist <= math.max(step, tolerance) then break end
+            local dir = (targetPos - hrp.Position).Unit
+            HardSet(hrp, CFrame.new(hrp.Position + dir * step))
+            RunService.Heartbeat:Wait()
+            RunService.Heartbeat:Wait()
+        end
+        if died or aborted or not hrp.Parent then
+            RestoreChar(char, hrp, hum)
+            cleanupConn()
+            return false, math.huge, "이동 중 사망/리스폰됨"
+        end
+        HardSet(hrp, targetCF)
+
+        -- 4) 앵커 홀드: 서버 Correction이 와도 안 끌려감
+        local holdUntil = os.clock() + holdTime
+        while os.clock() < holdUntil and not died do
+            if not hrp.Parent then break end
+            HardSet(hrp, targetCF)
+            RunService.Heartbeat:Wait()
+        end
+        if died then
+            RestoreChar(char, hrp, hum)
+            cleanupConn()
+            return false, math.huge, "도착 직후 사망함"
+        end
+
+        -- 5) 바닥 확인: 로딩 안 된 허공이면 해제하지 말고 대기/복귀 (추락사 방지)
+        local waited = 0
+        while waited < groundWait and not HasGroundBelow(targetPos, char) do
+            pcall(function() LocalPlayer:RequestStreamAroundAsync(targetPos, 2) end)
+            task.wait(0.5)
+            waited = waited + 0.5
+            HardSet(hrp, targetCF)
+        end
+        if not HasGroundBelow(targetPos, char) then
+            if safeReturn then
+                HardSet(hrp, startCF)
+                task.wait(0.2)
+                RestoreChar(char, hrp, hum)
+                cleanupConn()
+                return false, math.huge, "목적지 바닥 없음 - 출발지로 복귀함"
+            end
+            -- 복귀 OFF면 그래도 해제 (사용자 선택)
+        end
+
+        -- 6) 고정 해제 + 복구 + 최종 스냅
+        RestoreChar(char, hrp, hum)
+        for i = 1, 4 do
+            if not hrp.Parent or died then break end
+            HardSet(hrp, targetCF)
+            task.wait(0.08)
+        end
+        task.wait(0.3)
+        if died or not hrp.Parent then
+            cleanupConn()
+            return false, math.huge, "착지 중 사망/리스폰됨"
+        end
+        local finalDist = (hrp.Position - targetPos).Magnitude
+        if finalDist <= tolerance then
+            cleanupConn()
+            return true, finalDist, string.format("도착 (%.1f stud, %d회차)", finalDist, attempt)
+        end
+        -- 되돌려졌으면 다음 회차에서 재시도
+        if attempt < maxRetry then task.wait(0.4) end
+    end
+    cleanupConn()
+    local d = GetHRP() and (GetHRP().Position - targetPos).Magnitude or math.huge
+    return false, d, string.format("미도착 (남은 %.0f stud) - 서버가 되돌림. TPStep을 250으로 낮춰봐", d)
+end
+
+-- v1.5 TP 뮤텍스: 동시 이동 요청이 서로 잡아당기는 것 방지
+local function TeleportTo(cf, opts)
+    if TPBusy then return false, math.huge, "다른 이동 진행 중" end
+    TPBusy = true
+    local ok, a, b, c = pcall(TeleportToInner, cf, opts)
+    TPBusy = false
+    if not ok then return false, math.huge, "이동 중 오류: " .. tostring(a):sub(1, 100) end
+    return a, b, c
+end
+
+-- ===== v1.4: 내 기지 귀환 =====
+-- Homestead 슬롯에서 내 Plot을 찾아 스폰 지점 CFrame 반환
+local function ResolveHomeCF()
+    local cf
+    pcall(function()
+        if not Remotes or not Remotes.Homestead or not Remotes.Homestead.AskState then return end
+        local st = Remotes.Homestead.AskState:InvokeServer()
+        if type(st) == "table" and type(st.OwnersBySlot) == "table" then
+            for slot, uid in pairs(st.OwnersBySlot) do
+                if uid == LocalPlayer.UserId then
+                    local plots = Workspace:FindFirstChild("Plots")
+                    local plot = plots and plots:FindFirstChild(tostring(slot))
+                    if plot then
+                        local sp = plot:FindFirstChild("SpawnPoint")
+                        if sp and sp:IsA("BasePart") then cf = sp.CFrame return end
+                        local cp = plot:FindFirstChild("CenterPoint")
+                        if cp and cp:IsA("BasePart") then cf = cp.CFrame return end
+                        cf = plot:GetPivot()
+                        return
+                    end
+                end
+            end
+        end
+    end)
+    return cf
+end
+
+local function GoHomeNow(reason)
+    task.spawn(function()
+        local cf = ResolveHomeCF()
+        if not cf then
+            Notify("귀환 실패", "내 기지를 못 찾았어 (Homestead 확인 실패)")
+            return
+        end
+        Notify("귀환 중", reason or "내 기지로 이동")
+        local ok, _, msg = TeleportTo(cf)
+        Notify(ok and "귀환 완료" or "귀환 실패", tostring(msg), 4)
+    end)
 end
 
 -- ===== GUI =====
@@ -167,7 +413,7 @@ local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, -60, 0, 30)
 Title.Position = UDim2.new(0, 10, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "🥚 Steal an Egg - Stock v1"
+Title.Text = "🥚 Steal an Egg - Stock v1.5"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 15
@@ -197,6 +443,18 @@ Status.TextSize = 12
 Status.TextXAlignment = Enum.TextXAlignment.Left
 Status.Parent = Main
 
+local PhaseLabel = Instance.new("TextLabel")
+PhaseLabel.Size = UDim2.new(1, -20, 0, 16)
+PhaseLabel.Position = UDim2.new(0, 10, 0, 50)
+PhaseLabel.BackgroundTransparency = 1
+PhaseLabel.Text = "자동스틸: OFF | 대기중"
+PhaseLabel.TextColor3 = Color3.fromRGB(255, 220, 130)
+PhaseLabel.Font = Enum.Font.GothamMedium
+PhaseLabel.TextSize = 11
+PhaseLabel.TextXAlignment = Enum.TextXAlignment.Left
+PhaseLabel.TextTruncate = Enum.TextTruncate.AtEnd
+PhaseLabel.Parent = Main
+
 -- 컨트롤 행 1: 새로고침 / 자동새로고침 / ESP / 자동스틸
 local function MakeSmallBtn(parent, pos, size, text, initial, cb)
     local b = Instance.new("TextButton")
@@ -220,19 +478,21 @@ end
 
 local CtrlRow = Instance.new("Frame")
 CtrlRow.Size = UDim2.new(1, -20, 0, 30)
-CtrlRow.Position = UDim2.new(0, 10, 0, 52)
+CtrlRow.Position = UDim2.new(0, 10, 0, 68)
 CtrlRow.BackgroundTransparency = 1
 CtrlRow.Parent = Main
 
-local RefreshBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 0, 0, 0), UDim2.new(0, 80, 1, 0), "새로고침", nil, nil)
-local AutoRefBtn, getAutoRef, setAutoRef = MakeSmallBtn(CtrlRow, UDim2.new(0, 86, 0, 0), UDim2.new(0, 100, 1, 0), "자동갱신", Config.AutoRefresh, function(v) Config.AutoRefresh = v end)
-local ESPBtn, getESP, setESP = MakeSmallBtn(CtrlRow, UDim2.new(0, 192, 0, 0), UDim2.new(0, 80, 1, 0), "ESP", Config.ESP, function(v) Config.ESP = v if not v then ClearESP() end end)
-local StealBtn, getSteal, setSteal = MakeSmallBtn(CtrlRow, UDim2.new(0, 278, 0, 0), UDim2.new(0, 100, 1, 0), "자동스틸", Config.AutoSteal, function(v) Config.AutoSteal = v end)
+local RefreshBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 0, 0, 0), UDim2.new(0, 70, 1, 0), "새로고침", nil, nil)
+local AutoRefBtn, getAutoRef, setAutoRef = MakeSmallBtn(CtrlRow, UDim2.new(0, 76, 0, 0), UDim2.new(0, 88, 1, 0), "자동갱신", Config.AutoRefresh, function(v) Config.AutoRefresh = v end)
+local ESPBtn, getESP, setESP = MakeSmallBtn(CtrlRow, UDim2.new(0, 170, 0, 0), UDim2.new(0, 62, 1, 0), "ESP", Config.ESP, function(v) Config.ESP = v if not v then ClearESP() end end)
+local StealBtn, getSteal, setSteal = MakeSmallBtn(CtrlRow, UDim2.new(0, 238, 0, 0), UDim2.new(0, 88, 1, 0), "자동스틸", Config.AutoSteal, function(v) Config.AutoSteal = v end)
+local HomeBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 332, 0, 0), UDim2.new(0, 70, 1, 0), "🏠 귀환", nil, nil)
+HomeBtn.MouseButton1Click:Connect(function() GoHomeNow("수동 귀환") end)
 
 -- 컨트롤 행 2: 최소랭크 / 뮤테이션만 / 검색
 local FilterRow = Instance.new("Frame")
 FilterRow.Size = UDim2.new(1, -20, 0, 30)
-FilterRow.Position = UDim2.new(0, 10, 0, 86)
+FilterRow.Position = UDim2.new(0, 10, 0, 102)
 FilterRow.BackgroundTransparency = 1
 FilterRow.Parent = Main
 
@@ -281,8 +541,8 @@ local sbc = Instance.new("UICorner") sbc.CornerRadius = UDim.new(0, 6) sbc.Paren
 SearchBox:GetPropertyChangedSignal("Text"):Connect(function() RefreshList() end)
 
 local Scroll = Instance.new("ScrollingFrame")
-Scroll.Size = UDim2.new(1, -20, 1, -128)
-Scroll.Position = UDim2.new(0, 10, 0, 120)
+Scroll.Size = UDim2.new(1, -20, 1, -144)
+Scroll.Position = UDim2.new(0, 10, 0, 136)
 Scroll.BackgroundTransparency = 1
 Scroll.BorderSizePixel = 0
 Scroll.ScrollBarThickness = 4
@@ -420,12 +680,17 @@ function RefreshList()
             tp.Parent = row
             local tpc = Instance.new("UICorner") tpc.CornerRadius = UDim.new(0, 6) tpc.Parent = tp
             tp.MouseButton1Click:Connect(function()
-                if typeof(rec.BottomCFrame) == "CFrame" then
-                    TeleportTo(rec.BottomCFrame)
-                    Notify("이동", tostring(rec.AssetCategory) .. "로 TP")
-                else
+                if typeof(rec.BottomCFrame) ~= "CFrame" then
                     Notify("이동 실패", "좌표 없음")
+                    return
                 end
+                tp.Text = "..."
+                task.spawn(function()
+                    Notify("이동 중", tostring(rec.AssetCategory) .. "로 TP 시도")
+                    local ok, dist, msg = TeleportTo(rec.BottomCFrame)
+                    pcall(function() tp.Text = "TP" end)
+                    Notify(ok and "이동 완료" or "이동 실패", tostring(rec.AssetCategory) .. " " .. tostring(msg), 4)
+                end)
             end)
             local st = Instance.new("TextButton")
             st.Size = UDim2.new(0, 48, 0, 22) st.Position = UDim2.new(1, -52, 0, 4)
@@ -434,10 +699,12 @@ function RefreshList()
             st.Parent = row
             local stc = Instance.new("UICorner") stc.CornerRadius = UDim.new(0, 6) stc.Parent = st
             st.MouseButton1Click:Connect(function()
-                Notify("스틸 시도", tostring(rec.AssetCategory) .. " " .. tostring(rec.Uid):sub(1, 8))
-                if typeof(rec.BottomCFrame) == "CFrame" then TeleportTo(rec.BottomCFrame) task.wait(0.35) end
-                local ok, msg = TryCarry(rec.Uid)
-                Notify(ok and "스틸 결과" or "스틸 실패", tostring(msg):sub(1, 120), 4)
+                -- v1.5 시퀀스: 알 TP → E 3초 홀드 → 기지 귀환
+                if StealEggDoSteal then
+                    StealEggDoSteal(rec, false)
+                else
+                    Notify("스틸 실패", "로딩 중, 잠시 후 다시 눌러줘")
+                end
             end)
             local hatch = Instance.new("TextButton")
             hatch.Size = UDim2.new(0, 100, 0, 18) hatch.Position = UDim2.new(1, -104, 0, 30)
@@ -486,9 +753,104 @@ end
 
 RefreshBtn.MouseButton1Click:Connect(function() DoFetch(true) end)
 
--- 자동 스틸 루프: 최고 랭크 1개 시도
-local function AutoStealTick()
-    if not Config.AutoSteal then return end
+-- ===== v1.5 자동스틸: 알 TP(낮게) → E 3초 홀드 → 기지 귀환 (순차 실행) =====
+getgenv().StealEgg = getgenv().StealEgg or {}
+local SE = getgenv().StealEgg
+SE.phase = "idle" -- idle | run
+SE.busy = false
+
+local CarryState = { holding = false, uid = nil, at = -9999 }
+
+-- FieldEggCarry 이벤트 감시 (줍기 감지용, 읽기 전용)
+local function EnsureCarryListener()
+    if getgenv().StealEggCarryHooked then return end
+    if not Remotes or not Remotes.EggWorld or not Remotes.EggWorld.FieldEggCarry then return end
+    getgenv().StealEggCarryHooked = true
+    pcall(function()
+        Remotes.EggWorld.FieldEggCarry.OnClientEvent:Connect(function(...)
+            CarryState.at = os.clock()
+            local args = {...}
+            for _, a in ipairs(args) do
+                if type(a) == "string" and #a == 32 and string.match(a, "^%x+$") then
+                    CarryState.uid = a
+                elseif type(a) == "table" and type(a.Uid) == "string" then
+                    CarryState.uid = a.Uid
+                end
+            end
+            CarryState.holding = true
+            print("[StealEgg] FieldEggCarry 감지, uid=" .. tostring(CarryState.uid))
+        end)
+    end)
+end
+
+-- E 홀드 (실제 프롬프트 홀드 채우기용; VirtualInputManager 키 이벤트)
+local function HoldE(seconds)
+    seconds = seconds or 3
+    local vim
+    pcall(function() vim = game:GetService("VirtualInputManager") end)
+    if not vim then return false, "VirtualInputManager 없음" end
+    local okDown = pcall(function()
+        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    end)
+    if not okDown then return false, "키 입력 실패" end
+    local t0 = os.clock()
+    while os.clock() - t0 < seconds do
+        if not getgenv().StealEggStock_Loaded then break end
+        task.wait(0.25)
+    end
+    pcall(function()
+        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    return true, string.format("E 홀드 %.0f초", seconds)
+end
+
+local function FindCarryPrompt(pos)
+
+-- 내 기지에 이 알이 들어왔는지 확인 (스틸 성공 판정)
+    local best, bestD = nil, 15
+    pcall(function()
+        for _, d in ipairs(Workspace:GetChildren()) do
+            if d.Name == "SmartPromptPart" and d:IsA("BasePart") then
+                local dist = (d.Position - pos).Magnitude
+                if dist < bestD then
+                    local pr = d:FindFirstChild("CarryAreaEgg")
+                    if pr and pr:IsA("ProximityPrompt") then
+                        best, bestD = pr, dist
+                    end
+                end
+            end
+        end
+    end)
+    return best
+end
+
+local function FireCarryPrompt(prompt)
+    if typeof(fireproximityprompt) ~= "function" then
+        return false, "E 자동발동 미지원 - 직접 E를 눌러줘"
+    end
+    local ok, err = pcall(function() fireproximityprompt(prompt) end)
+    if ok then return true, "E 자동발동 시도" end
+    return false, tostring(err):sub(1, 120)
+end
+
+-- 내 기지에 이 알이 들어왔는지 확인 (스틸 성공 판정)
+local function CheckMineHas(uid)
+    if not uid then return nil end
+    local ok, live = pcall(function()
+        return Remotes.EggWorld.AskLiveSnapshot:InvokeServer()
+    end)
+    if not ok or type(live) ~= "table" then return nil end
+    for _, entry in ipairs(live) do
+        if type(entry) == "table" and entry.OwnerUserId == LocalPlayer.UserId then
+            if type(entry.Records) == "table" and entry.Records[uid] ~= nil then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function PickBestEgg()
     local best, bestRank = nil, -1
     for _, rec in ipairs(StockCache.Records or {}) do
         if rec.State == "Slot" or rec.State == "Dropped" then
@@ -498,23 +860,124 @@ local function AutoStealTick()
             end
         end
     end
-    if best and bestRank >= Config.MinRank then
-        if typeof(best.BottomCFrame) == "CFrame" then TeleportTo(best.BottomCFrame) end
-        task.wait(0.4)
-        local ok, msg = TryCarry(best.Uid)
-        Status.Text = (ok and "자동스틸 성공: " or "자동스틸 실패: ") .. tostring(best.AssetCategory) .. " " .. tostring(msg):sub(1, 80)
-        task.wait(1.5)
-        DoFetch(false)
-    end
+    if best and bestRank >= Config.MinRank then return best end
+    return nil
 end
 
--- 언로드
+function UpdatePhaseLabel()
+    local t = (SE.phase == "run") and "알 작업중..." or "대기중"
+    local carry = ""
+    if CarryState.holding and os.clock() - CarryState.at < 60 then
+        carry = " | 손에 알 감지됨"
+    end
+    pcall(function()
+        PhaseLabel.Text = "자동스틸: " .. (Config.AutoSteal and "ON" or "OFF") .. " | " .. t .. carry
+    end)
+end
+
+-- 핵심 시퀀스: 알 TP(낮게) → E발동 시도 → E 3초 홀드 → 기지 귀환 → 확인
+-- 수동 스틸 버튼 + 자동스틸 공용. 전역이라 GUI 버튼에서도 호출 가능.
+function StealEggDoSteal(rec, isAuto)
+    if SE.busy then
+        Notify("작업 중", "이전 작업 끝날 때까지 대기해줘")
+        return
+    end
+    if not rec or typeof(rec.BottomCFrame) ~= "CFrame" then
+        Notify("스틸 실패", "좌표 없음")
+        return
+    end
+    SE.busy = true
+    SE.phase = "run"
+    UpdatePhaseLabel()
+    local tag = tostring(rec.AssetCategory)
+    task.spawn(function()
+        local function done(msg, ok)
+            Status.Text = msg
+            Notify(ok and "스틸" or "스틸 실패", tostring(msg):sub(1, 120), 4)
+            SE.busy = false
+            SE.phase = "idle"
+            UpdatePhaseLabel()
+            DoFetch(false)
+        end
+        -- 1) 알로 이동 (프롬프트 범위 8 안에 들도록 낮게)
+        Status.Text = (isAuto and "자동스틸: " or "") .. tag .. "로 이동중"
+        local okTP, _, msgTP = TeleportTo(rec.BottomCFrame, { alt = 5 })
+        if not okTP then
+            done("알 TP 실패: " .. tostring(msgTP):sub(1, 80), false)
+            return
+        end
+        task.wait(0.4)
+        -- 2) 즉시 발동 시도
+        if Config.AutoFireE ~= false then
+            local pr = FindCarryPrompt(rec.BottomCFrame.Position)
+            if pr then pcall(function() FireCarryPrompt(pr) end) end
+        end
+        -- 3) E 3초 홀드
+        Status.Text = tag .. " 앞에서 E 홀드 중... (3초)"
+        local _, msgH = HoldE(3)
+        Status.Text = tag .. " " .. tostring(msgH) .. " → 기지로 복귀"
+        task.wait(0.3)
+        -- 4) 기지로 귀환
+        local cf = ResolveHomeCF()
+        if not cf then
+            done("귀환 실패: 내 기지를 못 찾았어", false)
+            return
+        end
+        local okH2, _, msgH2 = TeleportTo(cf)
+        if not okH2 then
+            done("귀환 실패: " .. tostring(msgH2):sub(1, 80), false)
+            return
+        end
+        task.wait(1.0)
+        -- 5) 내 기지에 들어왔는지 확인
+        local has = CheckMineHas(rec.Uid)
+        if has == true then
+            done("스틸 성공! " .. tag .. " 내 기지 확인됨", true)
+        elseif has == false then
+            done("귀환 완료. " .. tag .. " 배치 미확인 - 직접 확인해줘", true)
+        else
+            done("귀환 완료. " .. tag .. " (확인 불가)", true)
+        end
+    end)
+end
+
+-- 0.5초마다 도는 상태머신 (긴 작업은 StealEggDoSteal 안 spawn으로)
+local function StealFastTick()
+    EnsureCarryListener()
+    if SE.phase == "idle" and Config.AutoSteal and not SE.busy then
+        local best = PickBestEgg()
+        if best then StealEggDoSteal(best, true) end
+    end
+    UpdatePhaseLabel()
+end
+
+-- 언로드 (TP 중 앵커/충돌 복구 포함)
 getgenv().StealEggStock_Cleanup = function()
     for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
     table.clear(Connections)
     ClearESP()
+    pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart") or nil
+        local hum = char and char:FindFirstChildOfClass("Humanoid") or nil
+        if hrp then hrp.Anchored = false end
+        if hum then hum.PlatformStand = false end
+        if char then
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    pcall(function() p.CanCollide = (p.Name ~= "Head") end)
+                end
+            end
+        end
+    end)
     for _, g in ipairs(GuiObjects) do pcall(function() g:Destroy() end) end
     table.clear(GuiObjects)
+    getgenv().StealEggCarryHooked = false
+    TPBusy = false
+    if getgenv().StealEgg then
+        getgenv().StealEgg.phase = "idle"
+        getgenv().StealEgg.busy = false
+    end
     getgenv().StealEggStock_Loaded = false
 end
 
@@ -528,18 +991,24 @@ table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp
     end
 end))
 
--- 메인 루프
+-- 메인 루프 (0.5초 상태머신 + 주기적 스톡 갱신)
 task.spawn(function()
     DoFetch(false)
+    local lastSlow = os.clock()
     while getgenv().StealEggStock_Loaded do
-        local waitSec = tonumber(Config.RefreshSec) or 5
-        if waitSec < 3 then waitSec = 3 end
-        task.wait(waitSec)
+        task.wait(0.5)
         if not getgenv().StealEggStock_Loaded then break end
-        if Config.AutoRefresh then DoFetch(false) end
-        AutoStealTick()
+        pcall(StealFastTick)
+        local slowSec = math.max(3, tonumber(Config.RefreshSec) or 5)
+        if Config.AutoRefresh and os.clock() - lastSlow >= slowSec then
+            lastSlow = os.clock()
+            -- TP/귀환 작업 중에는 스톡 갱신으로 상태창 덮지 않기
+            if SE.phase == "idle" then
+                DoFetch(false)
+            end
+        end
     end
 end)
 
-Notify("StealEgg Stock v1", "로드됨. RightShift로 창 토글", 4)
-print("[StealEggStock v1] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
+Notify("StealEgg Stock v1.5", "로드됨. RightShift 토글 / E3초후 귀환", 4)
+print("[StealEggStock v1.5] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
