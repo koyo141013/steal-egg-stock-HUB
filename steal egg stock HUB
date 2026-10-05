@@ -1,0 +1,545 @@
+-- Steal an Egg : Stock / ESP / TP / Auto-Steal v1
+-- PlaceId 107778070777162 전용
+-- RightShift = 창 열기/닫기
+
+if getgenv().StealEggStock_Loaded then
+    pcall(function() getgenv().StealEggStock_Cleanup() end)
+    task.wait(0.1)
+end
+getgenv().StealEggStock_Loaded = true
+
+local cloneref = (cloneref or clone_ref or function(x) return x end)
+local Players = cloneref(game:GetService("Players"))
+local Workspace = cloneref(game:GetService("Workspace"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local StarterGui = cloneref(game:GetService("StarterGui"))
+local CoreGui = cloneref(game:GetService("CoreGui"))
+local UserInputService = cloneref(game:GetService("UserInputService"))
+
+local LocalPlayer = Players.LocalPlayer
+if game.PlaceId ~= 107778070777162 then
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = "StealEgg Stock", Text = "PlaceId 불일치: Steal an Egg에서 실행해줘", Duration = 4 })
+    end)
+end
+
+getgenv().StealEggConfig = getgenv().StealEggConfig or {
+    MinRank = 1,
+    MutationOnly = false,
+    AutoRefresh = true,
+    RefreshSec = 5,
+    ESP = false,
+    AutoSteal = false,
+    NotifyRare = true,
+    NotifyRank = 6, -- 이 Rank 이상 뜨면 알림 (Mythic/Rainbow=6, Secret=8 등)
+}
+local Config = getgenv().StealEggConfig
+
+local function Notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = dur or 3 })
+    end)
+end
+
+-- ===== Remotes / Data =====
+local Remotes, AssetsMod, RarityMod
+pcall(function() Remotes = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Remotes")) end)
+pcall(function() AssetsMod = require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("Assets")) end)
+pcall(function() RarityMod = require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("Rarity")) end)
+
+local AssetDir = (AssetsMod and AssetsMod.Directory) or {}
+local ByRarity = (AssetsMod and AssetsMod.ByRarity) or {}
+
+local function GetRarityInfo(category)
+    local entry = AssetDir[category]
+    if entry and entry.Rarity then
+        return entry.Rarity._id or entry.Rarity.DisplayName or "?", tonumber(entry.Rarity.Rank) or 0, entry.Rarity.DisplayName or tostring(entry.Rarity._id)
+    end
+    return "?", 0, "?"
+end
+
+local function GetMutations(rec)
+    if type(rec.Mutations) == "table" then
+        local t = {}
+        for _, m in pairs(rec.Mutations) do table.insert(t, tostring(m)) end
+        if rec.BaseMutation and #t == 0 then table.insert(t, tostring(rec.BaseMutation)) end
+        return t
+    end
+    if rec.BaseMutation then return { tostring(rec.BaseMutation) } end
+    return {}
+end
+
+local function FetchStock()
+    if not Remotes or not Remotes.EggWorld or not Remotes.EggWorld.AskFieldEggSnapshot then
+        return nil, "Remotes.EggWorld.AskFieldEggSnapshot 없음"
+    end
+    local ok, res = pcall(function()
+        return Remotes.EggWorld.AskFieldEggSnapshot:InvokeServer()
+    end)
+    if not ok then return nil, "Invoke 실패: " .. tostring(res):sub(1, 200) end
+    if type(res) ~= "table" then return nil, "응답 타입 이상: " .. type(res) end
+    return res, nil
+end
+
+local function TryCarry(uid)
+    if not Remotes or not Remotes.EggWorld or not Remotes.EggWorld.AskFieldEggCarry then
+        return false, "AskFieldEggCarry 리모트 없음"
+    end
+    local rf = Remotes.EggWorld.AskFieldEggCarry
+    local attempts = {
+        { args = { uid }, desc = "uid" },
+        { args = { { Uid = uid } }, desc = "{Uid}" },
+        { args = { { uid = uid } }, desc = "{uid}" },
+    }
+    local lastErr = ""
+    for _, a in ipairs(attempts) do
+        local ok, res = pcall(function()
+            return rf:InvokeServer(table.unpack(a.args))
+        end)
+        if ok then
+            return true, "시도(" .. a.desc .. ") 성공: " .. tostring(res):sub(1, 200)
+        else
+            lastErr = tostring(res):sub(1, 200)
+        end
+    end
+    return false, "전부 실패: " .. lastErr
+end
+
+local function TryHatch(uid)
+    if not Remotes or not Remotes.EggWorld or not Remotes.EggWorld.AskHatch then
+        return false, "AskHatch 리모트 없음"
+    end
+    local ok, res = pcall(function()
+        return Remotes.EggWorld.AskHatch:InvokeServer(uid)
+    end)
+    if ok then return true, tostring(res):sub(1, 200) end
+    return false, tostring(res):sub(1, 200)
+end
+
+local function GetHRP()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function TeleportTo(cf)
+    local hrp = GetHRP()
+    if not hrp or not cf then return false end
+    local target = cf + Vector3.new(0, 6, 0)
+    pcall(function()
+        hrp.CFrame = CFrame.new(target.Position, target.Position + Vector3.new(0, 0, 1))
+        hrp.Velocity = Vector3.zero
+        hrp.RotVelocity = Vector3.zero
+    end)
+    return true
+end
+
+-- ===== GUI =====
+local GuiObjects, Connections, ESPAdorns = {}, {}, {}
+
+local function GetGuiParent()
+    local ok, hui = pcall(function() return gethui() end)
+    if ok and typeof(hui) == "Instance" then return hui end
+    local ok2 = pcall(function() return CoreGui:GetChildren() end)
+    if ok2 then return CoreGui end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "StealEggStockGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 999
+table.insert(GuiObjects, ScreenGui)
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.new(0, 460, 0, 540)
+Main.Position = UDim2.new(0.5, -230, 0.5, -270)
+Main.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = ScreenGui
+local MainCorner = Instance.new("UICorner") MainCorner.CornerRadius = UDim.new(0, 8) MainCorner.Parent = Main
+local MainStroke = Instance.new("UIStroke") MainStroke.Color = Color3.fromRGB(70, 70, 90) MainStroke.Thickness = 1 MainStroke.Parent = Main
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -60, 0, 30)
+Title.Position = UDim2.new(0, 10, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "🥚 Steal an Egg - Stock v1"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 15
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Main
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 40, 0, 24)
+CloseBtn.Position = UDim2.new(1, -48, 0, 4)
+CloseBtn.Text = "X"
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 13
+CloseBtn.TextColor3 = Color3.fromRGB(255,255,255)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(140, 35, 35)
+CloseBtn.Parent = Main
+local cbc = Instance.new("UICorner") cbc.CornerRadius = UDim.new(0, 6) cbc.Parent = CloseBtn
+CloseBtn.MouseButton1Click:Connect(function() ScreenGui.Enabled = false end)
+
+local Status = Instance.new("TextLabel")
+Status.Size = UDim2.new(1, -20, 0, 20)
+Status.Position = UDim2.new(0, 10, 0, 30)
+Status.BackgroundTransparency = 1
+Status.Text = "로딩 중..."
+Status.TextColor3 = Color3.fromRGB(180, 200, 255)
+Status.Font = Enum.Font.GothamMedium
+Status.TextSize = 12
+Status.TextXAlignment = Enum.TextXAlignment.Left
+Status.Parent = Main
+
+-- 컨트롤 행 1: 새로고침 / 자동새로고침 / ESP / 자동스틸
+local function MakeSmallBtn(parent, pos, size, text, initial, cb)
+    local b = Instance.new("TextButton")
+    b.Size = size b.Position = pos
+    b.Font = Enum.Font.GothamBold b.TextSize = 12
+    b.TextColor3 = Color3.fromRGB(255,255,255)
+    b.Parent = parent
+    local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 6) cc.Parent = b
+    local state = initial
+    local function refresh()
+        if cb == nil then b.Text = text; b.BackgroundColor3 = Color3.fromRGB(70, 130, 255); return end
+        b.Text = text .. ":" .. (state and "ON" or "OFF")
+        b.BackgroundColor3 = state and Color3.fromRGB(30, 140, 70) or Color3.fromRGB(140, 35, 35)
+    end
+    refresh()
+    if cb then
+        b.MouseButton1Click:Connect(function() state = not state refresh() cb(state) end)
+    end
+    return b, function() return state end, function(v) state = v refresh() end
+end
+
+local CtrlRow = Instance.new("Frame")
+CtrlRow.Size = UDim2.new(1, -20, 0, 30)
+CtrlRow.Position = UDim2.new(0, 10, 0, 52)
+CtrlRow.BackgroundTransparency = 1
+CtrlRow.Parent = Main
+
+local RefreshBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 0, 0, 0), UDim2.new(0, 80, 1, 0), "새로고침", nil, nil)
+local AutoRefBtn, getAutoRef, setAutoRef = MakeSmallBtn(CtrlRow, UDim2.new(0, 86, 0, 0), UDim2.new(0, 100, 1, 0), "자동갱신", Config.AutoRefresh, function(v) Config.AutoRefresh = v end)
+local ESPBtn, getESP, setESP = MakeSmallBtn(CtrlRow, UDim2.new(0, 192, 0, 0), UDim2.new(0, 80, 1, 0), "ESP", Config.ESP, function(v) Config.ESP = v if not v then ClearESP() end end)
+local StealBtn, getSteal, setSteal = MakeSmallBtn(CtrlRow, UDim2.new(0, 278, 0, 0), UDim2.new(0, 100, 1, 0), "자동스틸", Config.AutoSteal, function(v) Config.AutoSteal = v end)
+
+-- 컨트롤 행 2: 최소랭크 / 뮤테이션만 / 검색
+local FilterRow = Instance.new("Frame")
+FilterRow.Size = UDim2.new(1, -20, 0, 30)
+FilterRow.Position = UDim2.new(0, 10, 0, 86)
+FilterRow.BackgroundTransparency = 1
+FilterRow.Parent = Main
+
+local RankLabel = Instance.new("TextLabel")
+RankLabel.Size = UDim2.new(0, 70, 1, 0)
+RankLabel.BackgroundTransparency = 1
+RankLabel.Text = "최소랭크:" .. tostring(Config.MinRank)
+RankLabel.TextColor3 = Color3.fromRGB(220,220,220)
+RankLabel.Font = Enum.Font.GothamMedium RankLabel.TextSize = 12
+RankLabel.Parent = FilterRow
+
+local RankMinus = Instance.new("TextButton")
+RankMinus.Size = UDim2.new(0, 28, 1, 0) RankMinus.Position = UDim2.new(0, 72, 0, 0)
+RankMinus.Text = "-" RankMinus.Font = Enum.Font.GothamBold RankMinus.TextSize = 14
+RankMinus.TextColor3 = Color3.fromRGB(255,255,255) RankMinus.BackgroundColor3 = Color3.fromRGB(50,50,58)
+RankMinus.Parent = FilterRow
+local rmc = Instance.new("UICorner") rmc.CornerRadius = UDim.new(0, 6) rmc.Parent = RankMinus
+
+local RankPlus = Instance.new("TextButton")
+RankPlus.Size = UDim2.new(0, 28, 1, 0) RankPlus.Position = UDim2.new(0, 104, 0, 0)
+RankPlus.Text = "+" RankPlus.Font = Enum.Font.GothamBold RankPlus.TextSize = 14
+RankPlus.TextColor3 = Color3.fromRGB(255,255,255) RankPlus.BackgroundColor3 = Color3.fromRGB(50,50,58)
+RankPlus.Parent = FilterRow
+local rpc = Instance.new("UICorner") rpc.CornerRadius = UDim.new(0, 6) rpc.Parent = RankPlus
+
+local function SetRank(v)
+    Config.MinRank = math.clamp(math.floor(v), 1, 12)
+    RankLabel.Text = "최소랭크:" .. tostring(Config.MinRank)
+end
+RankMinus.MouseButton1Click:Connect(function() SetRank(Config.MinRank - 1) RefreshList() end)
+RankPlus.MouseButton1Click:Connect(function() SetRank(Config.MinRank + 1) RefreshList() end)
+
+local MutBtn, getMut = MakeSmallBtn(FilterRow, UDim2.new(0, 140, 0, 0), UDim2.new(0, 110, 1, 0), "뮤테이션만", Config.MutationOnly, function(v) Config.MutationOnly = v RefreshList() end)
+
+local SearchBox = Instance.new("TextBox")
+SearchBox.Size = UDim2.new(1, -258, 1, 0)
+SearchBox.Position = UDim2.new(0, 256, 0, 0)
+SearchBox.PlaceholderText = "검색 (이름/지역)"
+SearchBox.Text = ""
+SearchBox.Font = Enum.Font.GothamMedium SearchBox.TextSize = 12
+SearchBox.TextColor3 = Color3.fromRGB(255,255,255)
+SearchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+SearchBox.ClearTextOnFocus = false
+SearchBox.Parent = FilterRow
+local sbc = Instance.new("UICorner") sbc.CornerRadius = UDim.new(0, 6) sbc.Parent = SearchBox
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function() RefreshList() end)
+
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Size = UDim2.new(1, -20, 1, -128)
+Scroll.Position = UDim2.new(0, 10, 0, 120)
+Scroll.BackgroundTransparency = 1
+Scroll.BorderSizePixel = 0
+Scroll.ScrollBarThickness = 4
+Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+Scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+Scroll.Parent = Main
+local SL = Instance.new("UIListLayout") SL.Padding = UDim.new(0, 4) SL.SortOrder = Enum.SortOrder.LayoutOrder SL.Parent = Scroll
+
+-- ===== Stock state =====
+local StockCache = { Records = {}, ServerTime = 0, FetchedAt = 0 }
+local NotifiedUids = {}
+
+function ClearESP()
+    for _, o in ipairs(ESPAdorns) do pcall(function() o:Destroy() end) end
+    table.clear(ESPAdorns)
+end
+
+local function FindWorkspaceModelByUid(uid)
+    local m = Workspace:FindFirstChild(uid, true)
+    if m and m:IsA("Model") then return m end
+    -- Uid가 이름인 모델 탐색 (얕게)
+    for _, ch in ipairs(Workspace:GetChildren()) do
+        if ch.Name == uid then return ch end
+    end
+    return nil
+end
+
+local function UpdateESP(records)
+    if not Config.ESP then return end
+    ClearESP()
+    for _, rec in ipairs(records) do
+        local cf = rec.BottomCFrame
+        if typeof(cf) == "CFrame" then
+            local adorn = Instance.new("SphereHandleAdornment")
+            adorn.Radius = 2
+            adorn.Transparency = 0.35
+            local _, rank = GetRarityInfo(rec.AssetCategory)
+            if rank >= 8 then adorn.Color3 = Color3.fromRGB(255, 50, 50)
+            elseif rank >= 6 then adorn.Color3 = Color3.fromRGB(255, 150, 30)
+            elseif rank >= 4 then adorn.Color3 = Color3.fromRGB(180, 80, 255)
+            else adorn.Color3 = Color3.fromRGB(80, 180, 255) end
+            adorn.Adornee = Workspace.Terrain
+            adorn.CFrame = cf + Vector3.new(0, 2, 0)
+            adorn.AlwaysOnTop = true
+            adorn.ZIndex = 5
+            adorn.Parent = CoreGui
+            table.insert(ESPAdorns, adorn)
+            local bb = Instance.new("BillboardGui")
+            bb.Size = UDim2.new(0, 220, 0, 40)
+            bb.StudsOffset = Vector3.new(0, 5, 0)
+            bb.AlwaysOnTop = true
+            bb.Adornee = Workspace.Terrain
+            bb.ExtentsOffsetWorldSpace = cf.Position
+            -- Adornee 대신 직접 위치 쓰기 위해 Part 이용
+            bb.Parent = CoreGui
+            table.insert(ESPAdorns, bb)
+            local tl = Instance.new("TextLabel")
+            tl.Size = UDim2.new(1, 0, 1, 0)
+            tl.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            tl.BackgroundTransparency = 0.4
+            tl.TextColor3 = Color3.fromRGB(255, 255, 255)
+            tl.Font = Enum.Font.GothamBold tl.TextSize = 12
+            local rname, rrank = GetRarityInfo(rec.AssetCategory)
+            tl.Text = string.format("%s [%s R%d]\n%s", tostring(rec.AssetCategory), tostring(rname), rrank, tostring(rec.AreaId))
+            tl.Parent = bb
+            -- Billboard 위치 고정용: 매 프레임 갱신은 아래 RenderStepped에서 처리하지 않고 1회성으로 둠 (Terrain adornee 한계)
+            -- 대신 10초 뒤 자동 제거 (리프레시 때 재생성)
+            task.delay(10, function() pcall(function() bb:Destroy() adorn:Destroy() end) end)
+        end
+    end
+end
+
+function PassFilter(rec)
+    local _, rank = GetRarityInfo(rec.AssetCategory)
+    if rank < Config.MinRank then return false end
+    local muts = GetMutations(rec)
+    if Config.MutationOnly and #muts == 0 then return false end
+    local q = string.lower(SearchBox.Text or "")
+    if q ~= "" then
+        local hay = string.lower(tostring(rec.AssetCategory) .. " " .. tostring(rec.AreaId) .. " " .. tostring(rec.NestId) .. " " .. tostring(rec.State))
+        if not string.find(hay, q, 1, true) then return false end
+    end
+    return true
+end
+
+function RefreshList()
+    for _, ch in ipairs(Scroll:GetChildren()) do
+        if ch:IsA("Frame") then ch:Destroy() end
+    end
+    local recs = StockCache.Records or {}
+    local shown, total = 0, #recs
+    -- 랭크 내림차순 정렬
+    local sorted = {}
+    for _, r in ipairs(recs) do table.insert(sorted, r) end
+    table.sort(sorted, function(a, b)
+        local _, ra = GetRarityInfo(a.AssetCategory)
+        local _, rb = GetRarityInfo(b.AssetCategory)
+        if ra ~= rb then return ra > rb end
+        return tostring(a.AssetCategory) < tostring(b.AssetCategory)
+    end)
+    local hrp = GetHRP()
+    for _, rec in ipairs(sorted) do
+        if PassFilter(rec) then
+            shown = shown + 1
+            if shown > 120 then break end
+            local rname, rank, dname = GetRarityInfo(rec.AssetCategory)
+            local muts = GetMutations(rec)
+            local distStr = "-"
+            if hrp and typeof(rec.BottomCFrame) == "CFrame" then
+                distStr = string.format("%dm", math.floor((hrp.Position - rec.BottomCFrame.Position).Magnitude / 3.28))
+            end
+            local row = Instance.new("Frame")
+            row.Size = UDim2.new(1, -4, 0, 52)
+            row.BackgroundColor3 = (rank >= 8) and Color3.fromRGB(60, 20, 20) or (rank >= 6) and Color3.fromRGB(50, 35, 15) or Color3.fromRGB(26, 26, 34)
+            row.BorderSizePixel = 0
+            row.Parent = Scroll
+            local rc = Instance.new("UICorner") rc.CornerRadius = UDim.new(0, 6) rc.Parent = row
+            local info = Instance.new("TextLabel")
+            info.Size = UDim2.new(1, -110, 1, 0)
+            info.Position = UDim2.new(0, 8, 0, 0)
+            info.BackgroundTransparency = 1
+            info.Font = Enum.Font.GothamMedium info.TextSize = 12
+            info.TextColor3 = Color3.fromRGB(235, 235, 235)
+            info.TextXAlignment = Enum.TextXAlignment.Left
+            info.TextYAlignment = Enum.TextYAlignment.Center
+            local mutStr = (#muts > 0) and ("✨" .. table.concat(muts, ",")) or "노말"
+            info.Text = string.format("%s [%s R%d] %s\n%s | %s | %s", tostring(rec.AssetCategory), tostring(rname), rank, mutStr, tostring(rec.AreaId), tostring(rec.State), distStr)
+            info.TextTruncate = Enum.TextTruncate.AtEnd
+            info.Parent = row
+            local tp = Instance.new("TextButton")
+            tp.Size = UDim2.new(0, 48, 0, 22) tp.Position = UDim2.new(1, -104, 0, 4)
+            tp.Text = "TP" tp.Font = Enum.Font.GothamBold tp.TextSize = 12
+            tp.TextColor3 = Color3.fromRGB(255,255,255) tp.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+            tp.Parent = row
+            local tpc = Instance.new("UICorner") tpc.CornerRadius = UDim.new(0, 6) tpc.Parent = tp
+            tp.MouseButton1Click:Connect(function()
+                if typeof(rec.BottomCFrame) == "CFrame" then
+                    TeleportTo(rec.BottomCFrame)
+                    Notify("이동", tostring(rec.AssetCategory) .. "로 TP")
+                else
+                    Notify("이동 실패", "좌표 없음")
+                end
+            end)
+            local st = Instance.new("TextButton")
+            st.Size = UDim2.new(0, 48, 0, 22) st.Position = UDim2.new(1, -52, 0, 4)
+            st.Text = "스틸" st.Font = Enum.Font.GothamBold st.TextSize = 12
+            st.TextColor3 = Color3.fromRGB(255,255,255) st.BackgroundColor3 = Color3.fromRGB(30, 140, 70)
+            st.Parent = row
+            local stc = Instance.new("UICorner") stc.CornerRadius = UDim.new(0, 6) stc.Parent = st
+            st.MouseButton1Click:Connect(function()
+                Notify("스틸 시도", tostring(rec.AssetCategory) .. " " .. tostring(rec.Uid):sub(1, 8))
+                if typeof(rec.BottomCFrame) == "CFrame" then TeleportTo(rec.BottomCFrame) task.wait(0.35) end
+                local ok, msg = TryCarry(rec.Uid)
+                Notify(ok and "스틸 결과" or "스틸 실패", tostring(msg):sub(1, 120), 4)
+            end)
+            local hatch = Instance.new("TextButton")
+            hatch.Size = UDim2.new(0, 100, 0, 18) hatch.Position = UDim2.new(1, -104, 0, 30)
+            hatch.Text = "부화시도" hatch.Font = Enum.Font.GothamMedium hatch.TextSize = 11
+            hatch.TextColor3 = Color3.fromRGB(220,220,220) hatch.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+            hatch.Parent = row
+            local hc = Instance.new("UICorner") hc.CornerRadius = UDim.new(0, 6) hc.Parent = hatch
+            hatch.MouseButton1Click:Connect(function()
+                local ok, msg = TryHatch(rec.Uid)
+                Notify(ok and "부화 결과" or "부화 실패", tostring(msg):sub(1, 120), 4)
+            end)
+        end
+    end
+    Status.Text = string.format("스톡 %d개 | 표시 %d개 | %s", total, shown, os.date("%H:%M:%S"))
+end
+
+local function DoFetch(manual)
+    Status.Text = "불러오는 중..."
+    local res, err = FetchStock()
+    if not res then
+        Status.Text = "실패: " .. tostring(err)
+        if manual then Notify("스톡 실패", tostring(err), 4) end
+        return
+    end
+    local list = res.Records or res.records or {}
+    -- Records가 dict 형태면 array로 변환
+    local arr = {}
+    if #list > 0 then arr = list
+    else for _, v in pairs(list) do table.insert(arr, v) end end
+    StockCache.Records = arr
+    StockCache.ServerTime = res.ServerTime or 0
+    StockCache.FetchedAt = os.clock()
+    -- 희귀 알림
+    if Config.NotifyRare then
+        for _, rec in ipairs(arr) do
+            local _, rank = GetRarityInfo(rec.AssetCategory)
+            if rank >= Config.NotifyRank and not NotifiedUids[rec.Uid] then
+                NotifiedUids[rec.Uid] = true
+                Notify("희귀 알!", string.format("%s [%s R%d] @%s", tostring(rec.AssetCategory), tostring((GetRarityInfo(rec.AssetCategory))), rank, tostring(rec.AreaId)), 5)
+            end
+        end
+    end
+    RefreshList()
+    UpdateESP(arr)
+end
+
+RefreshBtn.MouseButton1Click:Connect(function() DoFetch(true) end)
+
+-- 자동 스틸 루프: 최고 랭크 1개 시도
+local function AutoStealTick()
+    if not Config.AutoSteal then return end
+    local best, bestRank = nil, -1
+    for _, rec in ipairs(StockCache.Records or {}) do
+        if rec.State == "Slot" or rec.State == "Dropped" then
+            if PassFilter(rec) then
+                local _, rank = GetRarityInfo(rec.AssetCategory)
+                if rank > bestRank then best, bestRank = rec, rank end
+            end
+        end
+    end
+    if best and bestRank >= Config.MinRank then
+        if typeof(best.BottomCFrame) == "CFrame" then TeleportTo(best.BottomCFrame) end
+        task.wait(0.4)
+        local ok, msg = TryCarry(best.Uid)
+        Status.Text = (ok and "자동스틸 성공: " or "자동스틸 실패: ") .. tostring(best.AssetCategory) .. " " .. tostring(msg):sub(1, 80)
+        task.wait(1.5)
+        DoFetch(false)
+    end
+end
+
+-- 언로드
+getgenv().StealEggStock_Cleanup = function()
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    table.clear(Connections)
+    ClearESP()
+    for _, g in ipairs(GuiObjects) do pcall(function() g:Destroy() end) end
+    table.clear(GuiObjects)
+    getgenv().StealEggStock_Loaded = false
+end
+
+ScreenGui.Parent = GetGuiParent()
+ScreenGui.Enabled = true
+
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        ScreenGui.Enabled = not ScreenGui.Enabled
+    end
+end))
+
+-- 메인 루프
+task.spawn(function()
+    DoFetch(false)
+    while getgenv().StealEggStock_Loaded do
+        local waitSec = tonumber(Config.RefreshSec) or 5
+        if waitSec < 3 then waitSec = 3 end
+        task.wait(waitSec)
+        if not getgenv().StealEggStock_Loaded then break end
+        if Config.AutoRefresh then DoFetch(false) end
+        AutoStealTick()
+    end
+end)
+
+Notify("StealEgg Stock v1", "로드됨. RightShift로 창 토글", 4)
+print("[StealEggStock v1] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
