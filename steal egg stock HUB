@@ -1,4 +1,4 @@
--- Steal an Egg : Stock / ESP / TP / Auto-Steal v1.5
+-- Steal an Egg : Stock / ESP / TP / Auto-Steal v1.8
 -- PlaceId 107778070777162 전용
 -- RightShift = 창 열기/닫기
 -- v1.1: 장거리 TP 실패 수정 (스트리밍 요청 + 단계별 이동 + 다중 스냅 + 모션 제거)
@@ -7,6 +7,8 @@
 -- v1.4: 자동스틸 귀환 (알 줍기 감지 → 내 기지로 TP)
 -- v1.5: 스틸 시퀀스 단순화 (알 TP → E 3초 홀드 → 기지 귀환), 오감지/TP충돌 수정
 -- v1.6: 이동 중 사망 수정 (겹침 없는 착지점 + 착지 감시/구조 + 사망 원인 기록)
+-- v1.7: 업데이트 탭 + 체험 언어 한/영 자동 전환 + 노출시간 단축 + 피격시 즉시 귀환
+-- v1.8: BAC 킥 대응 세이프 모드 (TP/스틸 차단, 스톡/ESP만) + 폴링 지터
 
 if getgenv().StealEggStock_Loaded then
     pcall(function() getgenv().StealEggStock_Cleanup() end)
@@ -24,9 +26,31 @@ local UserInputService = cloneref(game:GetService("UserInputService"))
 local RunService = cloneref(game:GetService("RunService"))
 
 local LocalPlayer = Players.LocalPlayer
+
+-- ===== v1.7 언어: 체험 언어(로케일)에 따라 한국어/영어 자동 전환 =====
+-- (PlaceId 경고보다 먼저 정의되어야 함)
+local LANG = "ko"
+pcall(function()
+    local id = ""
+    pcall(function() id = tostring(LocalPlayer.LocaleId or "") end)
+    if id == "" then
+        pcall(function()
+            id = tostring(game:GetService("LocalizationService").RobloxLocaleId or "")
+        end)
+    end
+    id = string.lower(id)
+    if id ~= "" and string.sub(id, 1, 2) ~= "ko" then
+        LANG = "en"
+    end
+end)
+local function T(ko, en)
+    if LANG == "ko" then return ko end
+    return en
+end
+
 if game.PlaceId ~= 107778070777162 then
     pcall(function()
-        StarterGui:SetCore("SendNotification", { Title = "StealEgg Stock", Text = "PlaceId 불일치: Steal an Egg에서 실행해줘", Duration = 4 })
+        StarterGui:SetCore("SendNotification", { Title = "StealEgg Stock", Text = T("PlaceId 불일치: Steal an Egg에서 실행해줘", "Wrong PlaceId: run this in Steal an Egg"), Duration = 4 })
     end)
 end
 
@@ -42,16 +66,26 @@ getgenv().StealEggConfig = getgenv().StealEggConfig or {
     TPStep = 450, -- 장거리 TP 시 한 번에 이동할 최대 스터드 (작을수록 안정적, 느림)
     TPTimeout = 15, -- 한 번 TP에 쓸 최대 시간(초)
     TPTolerance = 15, -- 목표 도착 판정 거리(스터드)
-    TPHold = 1.5, -- 도착 후 앵커 고정으로 서버 되돌림 버티는 시간(초)
+    TPHold = 1.0, -- 도착 후 앵커 고정으로 서버 되돌림 버티는 시간(초)
     TPRetry = 3, -- 되돌려지면 다시 시도할 최대 횟수
     TPAlt = 10, -- 목표 위 공중 높이(스터드, 지형 겹침 방지)
-    TPGroundWait = 3, -- 해제 전 바닥 로딩 대기(초)
+    TPGroundWait = 2.0, -- 해제 전 바닥 로딩 대기(초)
     TPSafeReturn = true, -- 바닥 없으면 출발지로 복귀
     AutoFireE = true, -- 자동스틸: 알 앞에 가면 E(줍기 프롬프트) 자동발동 시도
     CarryTimeout = 25, -- (v1.5부터 미사용, 호환용)
     EHoldSec = 3, -- E 홀드 시간(초, 프롬프트 요구 1.2초 + 여유)
+    SafeMode = true, -- v1.8 세이프 모드: TP/스틸/E홀드 차단, 스톡+ESP만 동작 (킥 방지)
 }
 local Config = getgenv().StealEggConfig
+
+-- v1.8 마이그레이션: BAC 킥 후 보호용 세이프 모드 기본 ON
+if (Config._v or 0) < 8 then
+    if Config.TPHold == 1.5 then Config.TPHold = 1.0 end
+    if Config.TPGroundWait == 3 then Config.TPGroundWait = 2.0 end
+    if Config.FleeHP == nil then Config.FleeHP = 25 end -- 시작 체력 대비 이만큼 깎이면 피격으로 보고 즉시 귀환
+    Config.SafeMode = true
+    Config._v = 8
+end
 
 local function Notify(title, text, dur)
     pcall(function()
@@ -89,13 +123,13 @@ end
 
 local function FetchStock()
     if not Remotes or not Remotes.EggWorld or not Remotes.EggWorld.AskFieldEggSnapshot then
-        return nil, "Remotes.EggWorld.AskFieldEggSnapshot 없음"
+        return nil, T("Remotes.EggWorld.AskFieldEggSnapshot 없음", "Missing Remotes.EggWorld.AskFieldEggSnapshot")
     end
     local ok, res = pcall(function()
         return Remotes.EggWorld.AskFieldEggSnapshot:InvokeServer()
     end)
-    if not ok then return nil, "Invoke 실패: " .. tostring(res):sub(1, 200) end
-    if type(res) ~= "table" then return nil, "응답 타입 이상: " .. type(res) end
+    if not ok then return nil, T("Invoke 실패: ", "Invoke failed: ") .. tostring(res):sub(1, 200) end
+    if type(res) ~= "table" then return nil, T("응답 타입 이상: ", "Bad response type: ") .. type(res) end
     return res, nil
 end
 
@@ -120,7 +154,7 @@ local function TryCarry(uid)
             lastErr = tostring(res):sub(1, 200)
         end
     end
-    return false, "전부 실패: " .. lastErr
+    return false, T("전부 실패: ", "All attempts failed: ") .. lastErr
 end
 
 local function TryHatch(uid)
@@ -232,8 +266,8 @@ local function TeleportToInner(cf, opts)
     local hrp = GetHRP()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid") or nil
-    if not hrp or not cf or typeof(cf) ~= "CFrame" then return false, math.huge, "좌표/HRP 없음" end
-    if not hum or hum.Health <= 0 then return false, math.huge, "캐릭터 사망 상태" end
+    if not hrp or not cf or typeof(cf) ~= "CFrame" then return false, math.huge, T("좌표/HRP 없음", "No coordinates/HRP") end
+    if not hum or hum.Health <= 0 then return false, math.huge, T("캐릭터 사망 상태", "Character is dead") end
 
     local step = tonumber(opts.step or Config.TPStep) or 450
     if step < 100 then step = 100 end
@@ -276,13 +310,13 @@ local function TeleportToInner(cf, opts)
     end
 
     for attempt = 1, math.max(1, maxRetry) do
-        if not getgenv().StealEggStock_Loaded then cleanupConn() return false, math.huge, "언로드됨" end
+        if not getgenv().StealEggStock_Loaded then cleanupConn() return false, math.huge, T("언로드됨", "Unloaded") end
         hrp = GetHRP()
         char = LocalPlayer.Character
         hum = char and char:FindFirstChildOfClass("Humanoid") or nil
         if died or not hrp or not hum or hum.Health <= 0 then
             cleanupConn()
-            return false, math.huge, "이동 중 사망/리스폰됨"
+            return false, math.huge, T("이동 중 사망/리스폰됨", "Died/respawned while moving")
         end
 
         -- 1) 충돌 OFF + 즉시 앵커 (이 시점부터 추락 불가)
@@ -318,7 +352,7 @@ local function TeleportToInner(cf, opts)
         if died or aborted or not hrp.Parent then
             RestoreChar(char, hrp, hum)
             cleanupConn()
-            return false, math.huge, "이동 중 사망/리스폰됨"
+            return false, math.huge, T("이동 중 사망/리스폰됨", "Died/respawned while moving")
         end
         HardSet(hrp, targetCF)
 
@@ -333,7 +367,7 @@ local function TeleportToInner(cf, opts)
         if died then
             RestoreChar(char, hrp, hum)
             cleanupConn()
-            return false, math.huge, "도착 직후 사망함"
+            return false, math.huge, T("도착 직후 사망함", "Died right after arrival")
         end
 
         -- 5) 바닥 확인: 로딩 안 된 허공이면 해제하지 말고 대기/복귀 (추락사 방지)
@@ -351,7 +385,7 @@ local function TeleportToInner(cf, opts)
                 task.wait(0.2)
                 RestoreChar(char, hrp, hum)
                 cleanupConn()
-                return false, math.huge, "목적지 바닥 없음 - 출발지로 복귀함"
+                return false, math.huge, T("목적지 바닥 없음 - 출발지로 복귀함", "No ground at destination - returned to start")
             end
             -- 복귀 OFF면 그래도 해제 (사용자 선택)
         end
@@ -373,7 +407,7 @@ local function TeleportToInner(cf, opts)
         task.wait(0.3)
         if died or not hrp.Parent then
             cleanupConn()
-            return false, math.huge, "착지 중 사망/리스폰됨"
+            return false, math.huge, T("착지 중 사망/리스폰됨", "Died/respawned while landing")
         end
 
         -- 8) v1.6 착지 감시 1.5초: 허공 추락/튕김 캐치 → 안전지점으로 구조
@@ -405,28 +439,29 @@ local function TeleportToInner(cf, opts)
         end
         if died or not hrp.Parent then
             cleanupConn()
-            return false, math.huge, "착지 중 사망/리스폰됨"
+            return false, math.huge, T("착지 중 사망/리스폰됨", "Died/respawned while landing")
         end
         local finalDist = (hrp.Position - safePos).Magnitude
         if finalDist <= tolerance then
             cleanupConn()
-            return true, finalDist, string.format("도착 (%.1f stud, %d회차)", finalDist, attempt)
+            return true, finalDist, string.format(T("도착 (%.1f stud, %d회차)", "Arrived (%.1f stud, try %d)"), finalDist, attempt)
         end
         -- 되돌려졌으면 다음 회차에서 재시도
         if attempt < maxRetry then task.wait(0.4) end
     end
     cleanupConn()
     local d = GetHRP() and (GetHRP().Position - targetPos).Magnitude or math.huge
-    return false, d, string.format("미도착 (남은 %.0f stud) - 서버가 되돌림. TPStep을 250으로 낮춰봐", d)
+    return false, d, string.format(T("미도착 (남은 %.0f stud) - 서버가 되돌림. TPStep을 250으로 낮춰봐", "Not arrived (%.0f stud left) - server pulls back. Lower TPStep to 250"), d)
 end
 
 -- v1.5 TP 뮤텍스: 동시 이동 요청이 서로 잡아당기는 것 방지
 local function TeleportTo(cf, opts)
-    if TPBusy then return false, math.huge, "다른 이동 진행 중" end
+    if TPBusy then return false, math.huge, T("다른 이동 진행 중", "Another move in progress") end
+    if Config.SafeMode then return false, math.huge, T("세이프 모드 ON - 업데이트 탭에서 해제", "Safe mode ON - disable it in Updates tab") end
     TPBusy = true
     local ok, a, b, c = pcall(TeleportToInner, cf, opts)
     TPBusy = false
-    if not ok then return false, math.huge, "이동 중 오류: " .. tostring(a):sub(1, 100) end
+    if not ok then return false, math.huge, T("이동 중 오류: ", "Move error: ") .. tostring(a):sub(1, 100) end
     return a, b, c
 end
 
@@ -461,12 +496,12 @@ local function GoHomeNow(reason)
     task.spawn(function()
         local cf = ResolveHomeCF()
         if not cf then
-            Notify("귀환 실패", "내 기지를 못 찾았어 (Homestead 확인 실패)")
+            Notify(T("귀환 실패", "Return failed"), T("내 기지를 못 찾았어 (Homestead 확인 실패)", "Home base not found (Homestead check failed)"))
             return
         end
-        Notify("귀환 중", reason or "내 기지로 이동")
+        Notify(T("귀환 중", "Returning"), reason or T("내 기지로 이동", "Moving to home base"))
         local ok, _, msg = TeleportTo(cf)
-        Notify(ok and "귀환 완료" or "귀환 실패", tostring(msg), 4)
+        Notify(ok and T("귀환 완료", "Returned") or T("귀환 실패", "Return failed"), tostring(msg), 4)
     end)
 end
 
@@ -504,7 +539,7 @@ local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, -60, 0, 30)
 Title.Position = UDim2.new(0, 10, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "🥚 Steal an Egg - Stock v1.6"
+Title.Text = "🥚 Steal an Egg - Stock v1.8"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 15
@@ -527,7 +562,7 @@ local Status = Instance.new("TextLabel")
 Status.Size = UDim2.new(1, -20, 0, 20)
 Status.Position = UDim2.new(0, 10, 0, 30)
 Status.BackgroundTransparency = 1
-Status.Text = "로딩 중..."
+Status.Text = T("로딩 중...", "Loading...")
 Status.TextColor3 = Color3.fromRGB(180, 200, 255)
 Status.Font = Enum.Font.GothamMedium
 Status.TextSize = 12
@@ -538,7 +573,7 @@ local PhaseLabel = Instance.new("TextLabel")
 PhaseLabel.Size = UDim2.new(1, -20, 0, 16)
 PhaseLabel.Position = UDim2.new(0, 10, 0, 50)
 PhaseLabel.BackgroundTransparency = 1
-PhaseLabel.Text = "자동스틸: OFF | 대기중"
+PhaseLabel.Text = T("자동스틸: OFF | 대기중", "Auto-steal: OFF | Idle")
 PhaseLabel.TextColor3 = Color3.fromRGB(255, 220, 130)
 PhaseLabel.Font = Enum.Font.GothamMedium
 PhaseLabel.TextSize = 11
@@ -573,12 +608,12 @@ CtrlRow.Position = UDim2.new(0, 10, 0, 68)
 CtrlRow.BackgroundTransparency = 1
 CtrlRow.Parent = Main
 
-local RefreshBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 0, 0, 0), UDim2.new(0, 70, 1, 0), "새로고침", nil, nil)
-local AutoRefBtn, getAutoRef, setAutoRef = MakeSmallBtn(CtrlRow, UDim2.new(0, 76, 0, 0), UDim2.new(0, 88, 1, 0), "자동갱신", Config.AutoRefresh, function(v) Config.AutoRefresh = v end)
+local RefreshBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 0, 0, 0), UDim2.new(0, 70, 1, 0), T("새로고침", "Refresh"), nil, nil)
+local AutoRefBtn, getAutoRef, setAutoRef = MakeSmallBtn(CtrlRow, UDim2.new(0, 76, 0, 0), UDim2.new(0, 88, 1, 0), T("자동갱신", "Auto"), Config.AutoRefresh, function(v) Config.AutoRefresh = v end)
 local ESPBtn, getESP, setESP = MakeSmallBtn(CtrlRow, UDim2.new(0, 170, 0, 0), UDim2.new(0, 62, 1, 0), "ESP", Config.ESP, function(v) Config.ESP = v if not v then ClearESP() end end)
-local StealBtn, getSteal, setSteal = MakeSmallBtn(CtrlRow, UDim2.new(0, 238, 0, 0), UDim2.new(0, 88, 1, 0), "자동스틸", Config.AutoSteal, function(v) Config.AutoSteal = v end)
-local HomeBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 332, 0, 0), UDim2.new(0, 70, 1, 0), "🏠 귀환", nil, nil)
-HomeBtn.MouseButton1Click:Connect(function() GoHomeNow("수동 귀환") end)
+local StealBtn, getSteal, setSteal = MakeSmallBtn(CtrlRow, UDim2.new(0, 238, 0, 0), UDim2.new(0, 88, 1, 0), T("자동스틸", "AutoSteal"), Config.AutoSteal, function(v) Config.AutoSteal = v end)
+local HomeBtn = MakeSmallBtn(CtrlRow, UDim2.new(0, 332, 0, 0), UDim2.new(0, 70, 1, 0), T("🏠 귀환", "🏠 Home"), nil, nil)
+HomeBtn.MouseButton1Click:Connect(function() GoHomeNow(T("수동 귀환", "Manual return")) end)
 
 -- 컨트롤 행 2: 최소랭크 / 뮤테이션만 / 검색
 local FilterRow = Instance.new("Frame")
@@ -590,7 +625,7 @@ FilterRow.Parent = Main
 local RankLabel = Instance.new("TextLabel")
 RankLabel.Size = UDim2.new(0, 70, 1, 0)
 RankLabel.BackgroundTransparency = 1
-RankLabel.Text = "최소랭크:" .. tostring(Config.MinRank)
+RankLabel.Text = T("최소랭크:", "Min rank:") .. tostring(Config.MinRank)
 RankLabel.TextColor3 = Color3.fromRGB(220,220,220)
 RankLabel.Font = Enum.Font.GothamMedium RankLabel.TextSize = 12
 RankLabel.Parent = FilterRow
@@ -611,17 +646,17 @@ local rpc = Instance.new("UICorner") rpc.CornerRadius = UDim.new(0, 6) rpc.Paren
 
 local function SetRank(v)
     Config.MinRank = math.clamp(math.floor(v), 1, 12)
-    RankLabel.Text = "최소랭크:" .. tostring(Config.MinRank)
+    RankLabel.Text = T("최소랭크:", "Min rank:") .. tostring(Config.MinRank)
 end
 RankMinus.MouseButton1Click:Connect(function() SetRank(Config.MinRank - 1) RefreshList() end)
 RankPlus.MouseButton1Click:Connect(function() SetRank(Config.MinRank + 1) RefreshList() end)
 
-local MutBtn, getMut = MakeSmallBtn(FilterRow, UDim2.new(0, 140, 0, 0), UDim2.new(0, 110, 1, 0), "뮤테이션만", Config.MutationOnly, function(v) Config.MutationOnly = v RefreshList() end)
+local MutBtn, getMut = MakeSmallBtn(FilterRow, UDim2.new(0, 140, 0, 0), UDim2.new(0, 110, 1, 0), T("뮤테이션만", "Mutated only"), Config.MutationOnly, function(v) Config.MutationOnly = v RefreshList() end)
 
 local SearchBox = Instance.new("TextBox")
 SearchBox.Size = UDim2.new(1, -258, 1, 0)
 SearchBox.Position = UDim2.new(0, 256, 0, 0)
-SearchBox.PlaceholderText = "검색 (이름/지역)"
+SearchBox.PlaceholderText = T("검색 (이름/지역)", "Search (name/area)")
 SearchBox.Text = ""
 SearchBox.Font = Enum.Font.GothamMedium SearchBox.TextSize = 12
 SearchBox.TextColor3 = Color3.fromRGB(255,255,255)
@@ -632,8 +667,9 @@ local sbc = Instance.new("UICorner") sbc.CornerRadius = UDim.new(0, 6) sbc.Paren
 SearchBox:GetPropertyChangedSignal("Text"):Connect(function() RefreshList() end)
 
 local Scroll = Instance.new("ScrollingFrame")
-Scroll.Size = UDim2.new(1, -20, 1, -144)
-Scroll.Position = UDim2.new(0, 10, 0, 136)
+Scroll.Name = "StockScroll"
+Scroll.Size = UDim2.new(1, -20, 1, -176)
+Scroll.Position = UDim2.new(0, 10, 0, 168)
 Scroll.BackgroundTransparency = 1
 Scroll.BorderSizePixel = 0
 Scroll.ScrollBarThickness = 4
@@ -642,6 +678,147 @@ Scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 Scroll.ScrollingDirection = Enum.ScrollingDirection.Y
 Scroll.Parent = Main
 local SL = Instance.new("UIListLayout") SL.Padding = UDim.new(0, 4) SL.SortOrder = Enum.SortOrder.LayoutOrder SL.Parent = Scroll
+
+-- ===== v1.7 탭: 스톡 / 업데이트 =====
+local TabBar = Instance.new("Frame")
+TabBar.Size = UDim2.new(1, -20, 0, 26)
+TabBar.Position = UDim2.new(0, 10, 0, 136)
+TabBar.BackgroundTransparency = 1
+TabBar.Parent = Main
+
+local StockTab = Instance.new("TextButton")
+StockTab.Size = UDim2.new(0.5, -3, 1, 0)
+StockTab.Position = UDim2.new(0, 0, 0, 0)
+StockTab.Font = Enum.Font.GothamBold StockTab.TextSize = 12
+StockTab.TextColor3 = Color3.fromRGB(255, 255, 255)
+StockTab.Parent = TabBar
+local stc = Instance.new("UICorner") stc.CornerRadius = UDim.new(0, 6) stc.Parent = StockTab
+
+local UpdateTab = Instance.new("TextButton")
+UpdateTab.Size = UDim2.new(0.5, -3, 1, 0)
+UpdateTab.Position = UDim2.new(0.5, 3, 0, 0)
+UpdateTab.Font = Enum.Font.GothamBold UpdateTab.TextSize = 12
+UpdateTab.TextColor3 = Color3.fromRGB(255, 255, 255)
+UpdateTab.Parent = TabBar
+local utc = Instance.new("UICorner") utc.CornerRadius = UDim.new(0, 6) utc.Parent = UpdateTab
+
+local UpdateScroll = Instance.new("ScrollingFrame")
+UpdateScroll.Name = "UpdateScroll"
+UpdateScroll.Size = UDim2.new(1, -20, 1, -176)
+UpdateScroll.Position = UDim2.new(0, 10, 0, 168)
+UpdateScroll.BackgroundTransparency = 1
+UpdateScroll.BorderSizePixel = 0
+UpdateScroll.ScrollBarThickness = 4
+UpdateScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+UpdateScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+UpdateScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+UpdateScroll.Visible = false
+UpdateScroll.Parent = Main
+local UL = Instance.new("UIListLayout") UL.Padding = UDim.new(0, 6) UL.SortOrder = Enum.SortOrder.LayoutOrder UL.HorizontalAlignment = Enum.HorizontalAlignment.Center UL.Parent = UpdateScroll
+local UP = Instance.new("UIPadding")
+UP.PaddingTop = UDim.new(0, 4) UP.PaddingLeft = UDim.new(0, 4) UP.PaddingRight = UDim.new(0, 4) UP.PaddingBottom = UDim.new(0, 12)
+UP.Parent = UpdateScroll
+
+-- v1.8 세이프 모드 UI (업데이트 탭 최상단)
+local SafeLabel = Instance.new("TextLabel")
+SafeLabel.Size = UDim2.new(1, -4, 0, 0)
+SafeLabel.AutomaticSize = Enum.AutomaticSize.Y
+SafeLabel.BackgroundColor3 = Color3.fromRGB(60, 20, 20)
+SafeLabel.BorderSizePixel = 0
+SafeLabel.LayoutOrder = -2
+SafeLabel.Font = Enum.Font.GothamMedium SafeLabel.TextSize = 12
+SafeLabel.TextColor3 = Color3.fromRGB(255, 200, 200)
+SafeLabel.TextWrapped = true
+SafeLabel.TextXAlignment = Enum.TextXAlignment.Left
+SafeLabel.Parent = UpdateScroll
+local slc = Instance.new("UICorner") slc.CornerRadius = UDim.new(0, 6) slc.Parent = SafeLabel
+local slp = Instance.new("UIPadding")
+slp.PaddingTop = UDim.new(0, 8) slp.PaddingBottom = UDim.new(0, 8) slp.PaddingLeft = UDim.new(0, 10) slp.PaddingRight = UDim.new(0, 10)
+slp.Parent = SafeLabel
+
+local SafeBtn = Instance.new("TextButton")
+SafeBtn.Size = UDim2.new(1, -4, 0, 32)
+SafeBtn.LayoutOrder = -1
+SafeBtn.Font = Enum.Font.GothamBold SafeBtn.TextSize = 13
+SafeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SafeBtn.Parent = UpdateScroll
+local sbc2 = Instance.new("UICorner") sbc2.CornerRadius = UDim.new(0, 6) sbc2.Parent = SafeBtn
+
+local function RefreshSafe()
+    if Config.SafeMode then
+        SafeBtn.Text = T("세이프 모드: ON (TP/스틸 차단 중)", "Safe mode: ON (TP/steal blocked)")
+        SafeBtn.BackgroundColor3 = Color3.fromRGB(30, 140, 70)
+        SafeLabel.Text = T("⚠️ BAC 킥 감지됨. 세이프 모드 ON이라 스톡/ESP/알림만 동작하고 TP·스틸·귀환은 전부 차단돼. 해제하면 다시 킥(BAC-6515) → 밴으로 갈 수 있어. 부계정 권장!", "⚠️ BAC kick detected. Safe mode is ON: only stock/ESP/notifications work, TP/steal/return all blocked. Disabling risks another kick (BAC-6515) → ban. Use an alt!")
+    else
+        SafeBtn.Text = T("세이프 모드: OFF (킥/BAC 위험!)", "Safe mode: OFF (kick/BAC risk!)")
+        SafeBtn.BackgroundColor3 = Color3.fromRGB(140, 35, 35)
+        SafeLabel.Text = T("⚠️ 세이프 모드 OFF: TP·스틸 동작하지만 서버가 위치를 검증해서 킥/밴 가능. 짧게 쓰고 끄는 걸 권장!", "⚠️ Safe mode OFF: TP/steal work but the server validates positions - kick/ban possible. Use briefly!")
+    end
+    pcall(function() UpdatePhaseLabel() end)
+end
+SafeBtn.MouseButton1Click:Connect(function()
+    Config.SafeMode = not Config.SafeMode
+    RefreshSafe()
+end)
+RefreshSafe()
+
+local function RefreshTabs(isStock)
+    Scroll.Visible = isStock
+    UpdateScroll.Visible = not isStock
+    StockTab.Text = T("📋 스톡", "📋 Stock")
+    UpdateTab.Text = T("📝 업데이트", "📝 Updates")
+    StockTab.BackgroundColor3 = isStock and Color3.fromRGB(70, 130, 255) or Color3.fromRGB(50, 50, 58)
+    UpdateTab.BackgroundColor3 = (not isStock) and Color3.fromRGB(70, 130, 255) or Color3.fromRGB(50, 50, 58)
+end
+StockTab.MouseButton1Click:Connect(function() RefreshTabs(true) end)
+UpdateTab.MouseButton1Click:Connect(function() RefreshTabs(false) end)
+
+local CHANGELOG = {
+    { v = "V1.8", ko = "BAC 킥 대응: 세이프 모드(TP/스틸 차단, 스톡/ESP만). TP는 서버에 보여서 완전 우회 불가 - 부계정 권장.", en = "BAC kick response: safe mode (blocks TP/steal, stock/ESP only). Server sees TP so full bypass is impossible - use an alt." },
+    { v = "V1.7", ko = "업데이트 탭 + 한/영 자동 전환. TP 노출시간 단축, 맞으면 즉시 귀환(도망). E 입력 방식 추가.", en = "Updates tab + auto KO/EN. Shorter TP exposure, flee home when hit. Extra E-input method." },
+    { v = "V1.6", ko = "겹침 없는 착지점 + 착지 감시/구조. 사망 시 위치/단계/앵커 기록.", en = "Overlap-free landing + watch/rescue. Deaths log position/phase/anchor." },
+    { v = "V1.5", ko = "스틸 단순화: 알 TP → E 3초 → 기지 귀환. 오감지/TP충돌 수정.", en = "Simple steal: egg TP → hold E 3s → return. False-detection/TP-conflict fix." },
+    { v = "V1.4", ko = "자동스틸 귀환: 줍기 감지 → 기지로 TP. 귀환 버튼 추가.", en = "Auto-return: on carry → TP home. Home button added." },
+    { v = "V1.3", ko = "전구간 앵커 + 바닥확인 + 실패시 출발지 복귀.", en = "Full-time anchor + ground check + return on fail." },
+    { v = "V1.2", ko = "앵커 고정 + 홀드 + 재시도로 되돌림 방지.", en = "Anchor hold + retry against rubber-banding." },
+    { v = "V1.1", ko = "장거리 TP: 스트리밍 선요청 + 단계별 이동.", en = "Long-range TP: pre-streaming + stepwise travel." },
+    { v = "V1.0", ko = "스톡판 첫 버전: 실시간 알 목록, 레어도/뮤테이션 표시, TP/ESP.", en = "First stock board: live egg list, rarity/mutation, TP/ESP." },
+}
+for _, entry in ipairs(CHANGELOG) do
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, -4, 0, 0)
+    box.AutomaticSize = Enum.AutomaticSize.Y
+    box.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    box.BorderSizePixel = 0
+    box.Parent = UpdateScroll
+    local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 6) bc.Parent = box
+    local bp = Instance.new("UIPadding")
+    bp.PaddingTop = UDim.new(0, 8) bp.PaddingBottom = UDim.new(0, 8) bp.PaddingLeft = UDim.new(0, 10) bp.PaddingRight = UDim.new(0, 10)
+    bp.Parent = box
+    local bl = Instance.new("UIListLayout")
+    bl.Padding = UDim.new(0, 2) bl.SortOrder = Enum.SortOrder.LayoutOrder
+    bl.Parent = box
+    local vt = Instance.new("TextLabel")
+    vt.Size = UDim2.new(1, 0, 0, 18)
+    vt.BackgroundTransparency = 1
+    vt.Text = entry.v
+    vt.TextColor3 = Color3.fromRGB(120, 180, 255)
+    vt.Font = Enum.Font.GothamBold vt.TextSize = 13
+    vt.TextXAlignment = Enum.TextXAlignment.Left
+    vt.Parent = box
+    local dt = Instance.new("TextLabel")
+    dt.Size = UDim2.new(1, 0, 0, 0)
+    dt.AutomaticSize = Enum.AutomaticSize.Y
+    dt.BackgroundTransparency = 1
+    dt.Text = (LANG == "ko") and entry.ko or entry.en
+    dt.TextColor3 = Color3.fromRGB(220, 220, 220)
+    dt.Font = Enum.Font.GothamMedium dt.TextSize = 12
+    dt.TextWrapped = true
+    dt.TextXAlignment = Enum.TextXAlignment.Left
+    dt.TextYAlignment = Enum.TextYAlignment.Top
+    dt.Parent = box
+end
+RefreshTabs(true)
 
 -- ===== Stock state =====
 local StockCache = { Records = {}, ServerTime = 0, FetchedAt = 0 }
@@ -760,7 +937,7 @@ function RefreshList()
             info.TextColor3 = Color3.fromRGB(235, 235, 235)
             info.TextXAlignment = Enum.TextXAlignment.Left
             info.TextYAlignment = Enum.TextYAlignment.Center
-            local mutStr = (#muts > 0) and ("✨" .. table.concat(muts, ",")) or "노말"
+            local mutStr = (#muts > 0) and ("✨" .. table.concat(muts, ",")) or T("노말", "Normal")
             info.Text = string.format("%s [%s R%d] %s\n%s | %s | %s", tostring(rec.AssetCategory), tostring(rname), rank, mutStr, tostring(rec.AreaId), tostring(rec.State), distStr)
             info.TextTruncate = Enum.TextTruncate.AtEnd
             info.Parent = row
@@ -772,20 +949,20 @@ function RefreshList()
             local tpc = Instance.new("UICorner") tpc.CornerRadius = UDim.new(0, 6) tpc.Parent = tp
             tp.MouseButton1Click:Connect(function()
                 if typeof(rec.BottomCFrame) ~= "CFrame" then
-                    Notify("이동 실패", "좌표 없음")
+                    Notify(T("이동 실패", "Move failed"), T("좌표 없음", "No coordinates"))
                     return
                 end
                 tp.Text = "..."
                 task.spawn(function()
-                    Notify("이동 중", tostring(rec.AssetCategory) .. "로 TP 시도")
+                    Notify(T("이동 중", "Moving"), tostring(rec.AssetCategory) .. T("로 TP 시도", " TP try"))
                     local ok, dist, msg = TeleportTo(rec.BottomCFrame)
                     pcall(function() tp.Text = "TP" end)
-                    Notify(ok and "이동 완료" or "이동 실패", tostring(rec.AssetCategory) .. " " .. tostring(msg), 4)
+                    Notify(ok and T("이동 완료", "Arrived") or T("이동 실패", "Move failed"), tostring(rec.AssetCategory) .. " " .. tostring(msg), 4)
                 end)
             end)
             local st = Instance.new("TextButton")
             st.Size = UDim2.new(0, 48, 0, 22) st.Position = UDim2.new(1, -52, 0, 4)
-            st.Text = "스틸" st.Font = Enum.Font.GothamBold st.TextSize = 12
+            st.Text = T("스틸", "Steal") st.Font = Enum.Font.GothamBold st.TextSize = 12
             st.TextColor3 = Color3.fromRGB(255,255,255) st.BackgroundColor3 = Color3.fromRGB(30, 140, 70)
             st.Parent = row
             local stc = Instance.new("UICorner") stc.CornerRadius = UDim.new(0, 6) stc.Parent = st
@@ -794,30 +971,30 @@ function RefreshList()
                 if StealEggDoSteal then
                     StealEggDoSteal(rec, false)
                 else
-                    Notify("스틸 실패", "로딩 중, 잠시 후 다시 눌러줘")
+                    Notify(T("스틸 실패", "Steal failed"), T("로딩 중, 잠시 후 다시 눌러줘", "Loading, try again shortly"))
                 end
             end)
             local hatch = Instance.new("TextButton")
             hatch.Size = UDim2.new(0, 100, 0, 18) hatch.Position = UDim2.new(1, -104, 0, 30)
-            hatch.Text = "부화시도" hatch.Font = Enum.Font.GothamMedium hatch.TextSize = 11
+            hatch.Text = T("부화시도", "Hatch") hatch.Font = Enum.Font.GothamMedium hatch.TextSize = 11
             hatch.TextColor3 = Color3.fromRGB(220,220,220) hatch.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
             hatch.Parent = row
             local hc = Instance.new("UICorner") hc.CornerRadius = UDim.new(0, 6) hc.Parent = hatch
             hatch.MouseButton1Click:Connect(function()
                 local ok, msg = TryHatch(rec.Uid)
-                Notify(ok and "부화 결과" or "부화 실패", tostring(msg):sub(1, 120), 4)
+                Notify(ok and T("부화 결과", "Hatch result") or T("부화 실패", "Hatch failed"), tostring(msg):sub(1, 120), 4)
             end)
         end
     end
-    Status.Text = string.format("스톡 %d개 | 표시 %d개 | %s", total, shown, os.date("%H:%M:%S"))
+    Status.Text = string.format(T("스톡 %d개 | 표시 %d개 | %s", "Stock %d | shown %d | %s"), total, shown, os.date("%H:%M:%S"))
 end
 
 local function DoFetch(manual)
-    Status.Text = "불러오는 중..."
+    Status.Text = T("불러오는 중...", "Loading...")
     local res, err = FetchStock()
     if not res then
-        Status.Text = "실패: " .. tostring(err)
-        if manual then Notify("스톡 실패", tostring(err), 4) end
+        Status.Text = T("실패: ", "Failed: ") .. tostring(err)
+        if manual then Notify(T("스톡 실패", "Stock failed"), tostring(err), 4) end
         return
     end
     local list = res.Records or res.records or {}
@@ -834,7 +1011,7 @@ local function DoFetch(manual)
             local _, rank = GetRarityInfo(rec.AssetCategory)
             if rank >= Config.NotifyRank and not NotifiedUids[rec.Uid] then
                 NotifiedUids[rec.Uid] = true
-                Notify("희귀 알!", string.format("%s [%s R%d] @%s", tostring(rec.AssetCategory), tostring((GetRarityInfo(rec.AssetCategory))), rank, tostring(rec.AreaId)), 5)
+                Notify(T("희귀 알!", "Rare egg!"), string.format("%s [%s R%d] @%s", tostring(rec.AssetCategory), tostring((GetRarityInfo(rec.AssetCategory))), rank, tostring(rec.AreaId)), 5)
             end
         end
     end
@@ -875,24 +1052,48 @@ local function EnsureCarryListener()
 end
 
 -- E 홀드 (실제 프롬프트 홀드 채우기용; VirtualInputManager 키 이벤트)
-local function HoldE(seconds)
+local function HoldE(seconds, hp0)
     seconds = seconds or 3
+    local down, up
     local vim
     pcall(function() vim = game:GetService("VirtualInputManager") end)
-    if not vim then return false, "VirtualInputManager 없음" end
-    local okDown = pcall(function()
-        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-    end)
-    if not okDown then return false, "키 입력 실패" end
+    if vim then
+        down = function()
+            vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        end
+        up = function()
+            vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        end
+    elseif typeof(keypress) == "function" and typeof(keyrelease) == "function" then
+        down = function() keypress(0x45) end
+        up = function() keyrelease(0x45) end
+    else
+        return false, T("키 입력 수단 없음", "No key input method")
+    end
+    local okDown = pcall(down)
+    if not okDown then return false, T("키 입력 실패", "Key input failed") end
+    -- v1.7 피격 중단: 시작 체력보다 많이 깎이면(몹/유저 공격) E를 놓고 즉시 귀환
+    local fleeAt = (hp0 and (tonumber(Config.FleeHP) or 25) > 0) and (hp0 - (tonumber(Config.FleeHP) or 25)) or nil
     local t0 = os.clock()
+    local hurt = false
     while os.clock() - t0 < seconds do
         if not getgenv().StealEggStock_Loaded then break end
+        if fleeAt then
+            local hpNow
+            pcall(function()
+                local ch = LocalPlayer.Character
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                if hum then hpNow = hum.Health end
+            end)
+            if hpNow and hpNow <= fleeAt then hurt = true break end
+        end
         task.wait(0.25)
     end
-    pcall(function()
-        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-    end)
-    return true, string.format("E 홀드 %.0f초", seconds)
+    pcall(up)
+    if hurt then
+        return true, T("피격 감지 - 귀환!", "Hit detected - returning!")
+    end
+    return true, string.format(T("E 홀드 %.0f초", "E held %.0fs"), seconds)
 end
 
 local function FindCarryPrompt(pos)
@@ -917,10 +1118,10 @@ end
 
 local function FireCarryPrompt(prompt)
     if typeof(fireproximityprompt) ~= "function" then
-        return false, "E 자동발동 미지원 - 직접 E를 눌러줘"
+        return false, T("E 자동발동 미지원 - 직접 E를 눌러줘", "Auto-E unsupported - press E manually")
     end
     local ok, err = pcall(function() fireproximityprompt(prompt) end)
-    if ok then return true, "E 자동발동 시도" end
+    if ok then return true, T("E 자동발동 시도", "Auto-E fired") end
     return false, tostring(err):sub(1, 120)
 end
 
@@ -956,25 +1157,32 @@ local function PickBestEgg()
 end
 
 function UpdatePhaseLabel()
-    local t = (SE.phase == "run") and "알 작업중..." or "대기중"
+    local t = (SE.phase == "run") and T("알 작업중...", "Working on egg...") or T("대기중", "Idle")
+    if Config.SafeMode then
+        t = T("🛡 세이프 모드 (스톡/ESP만)", "🛡 Safe mode (stock/ESP only)")
+    end
     local carry = ""
     if CarryState.holding and os.clock() - CarryState.at < 60 then
-        carry = " | 손에 알 감지됨"
+        carry = T(" | 손에 알 감지됨", " | egg in hands")
     end
     pcall(function()
-        PhaseLabel.Text = "자동스틸: " .. (Config.AutoSteal and "ON" or "OFF") .. " | " .. t .. carry
+        PhaseLabel.Text = T("자동스틸: ", "Auto-steal: ") .. (Config.AutoSteal and "ON" or "OFF") .. " | " .. t .. carry
     end)
 end
 
 -- 핵심 시퀀스: 알 TP(낮게) → E발동 시도 → E 3초 홀드 → 기지 귀환 → 확인
 -- 수동 스틸 버튼 + 자동스틸 공용. 전역이라 GUI 버튼에서도 호출 가능.
 function StealEggDoSteal(rec, isAuto)
+    if Config.SafeMode then
+        Notify(T("세이프 모드", "Safe mode"), T("차단됨: 업데이트 탭에서 해제해야 스틸 가능 (킥/BAC 위험)", "Blocked: disable safe mode in Updates tab to steal (kick/BAC risk)"))
+        return
+    end
     if SE.busy then
-        Notify("작업 중", "이전 작업 끝날 때까지 대기해줘")
+        Notify(T("작업 중", "Busy"), T("이전 작업 끝날 때까지 대기해줘", "Wait for the previous job to finish"))
         return
     end
     if not rec or typeof(rec.BottomCFrame) ~= "CFrame" then
-        Notify("스틸 실패", "좌표 없음")
+        Notify(T("스틸 실패", "Steal failed"), T("좌표 없음", "No coordinates"))
         return
     end
     SE.busy = true
@@ -984,20 +1192,27 @@ function StealEggDoSteal(rec, isAuto)
     task.spawn(function()
         local function done(msg, ok)
             Status.Text = msg
-            Notify(ok and "스틸" or "스틸 실패", tostring(msg):sub(1, 120), 4)
+            Notify(ok and T("스틸", "Steal") or T("스틸 실패", "Steal failed"), tostring(msg):sub(1, 120), 4)
             SE.busy = false
             SE.phase = "idle"
             UpdatePhaseLabel()
             DoFetch(false)
         end
         -- 1) 알로 이동 (프롬프트 범위 8 안에 들도록 낮게)
-        Status.Text = (isAuto and "자동스틸: " or "") .. tag .. "로 이동중"
+        Status.Text = (isAuto and T("자동스틸: ", "Auto-steal: ") or "") .. tag .. T("로 이동중", " moving")
         local okTP, _, msgTP = TeleportTo(rec.BottomCFrame, { alt = 5 })
         if not okTP then
-            done("알 TP 실패: " .. tostring(msgTP):sub(1, 80), false)
+            done(T("알 TP 실패: ", "Egg TP failed: ") .. tostring(msgTP):sub(1, 80), false)
             return
         end
         task.wait(0.4)
+        -- 시작 체력 기록 (v1.7 피격 중단용)
+        local hp0
+        pcall(function()
+            local ch = LocalPlayer.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if hum then hp0 = hum.Health end
+        end)
         -- 2) 즉시 발동 시도
         if Config.AutoFireE ~= false then
             local pr = FindCarryPrompt(rec.BottomCFrame.Position)
@@ -1005,30 +1220,30 @@ function StealEggDoSteal(rec, isAuto)
         end
         -- 3) E 홀드 (프롬프트 1.2초 + 여유)
         local holdSec = tonumber(Config.EHoldSec) or 3
-        Status.Text = tag .. " 앞에서 E 홀드 중... (" .. tostring(holdSec) .. "초)"
-        local _, msgH = HoldE(holdSec)
-        Status.Text = tag .. " " .. tostring(msgH) .. " → 기지로 복귀"
+        Status.Text = tag .. T(" 앞에서 E 홀드 중... (", " holding E... (") .. tostring(holdSec) .. T("초)", "s)")
+        local _, msgH = HoldE(holdSec, hp0)
+        Status.Text = tag .. " " .. tostring(msgH) .. T(" → 기지로 복귀", " → returning home")
         task.wait(0.3)
         -- 4) 기지로 귀환
         local cf = ResolveHomeCF()
         if not cf then
-            done("귀환 실패: 내 기지를 못 찾았어", false)
+            done(T("귀환 실패: 내 기지를 못 찾았어", "Return failed: home base not found"), false)
             return
         end
         local okH2, _, msgH2 = TeleportTo(cf)
         if not okH2 then
-            done("귀환 실패: " .. tostring(msgH2):sub(1, 80), false)
+            done(T("귀환 실패: ", "Return failed: ") .. tostring(msgH2):sub(1, 80), false)
             return
         end
         task.wait(1.0)
         -- 5) 내 기지에 들어왔는지 확인
         local has = CheckMineHas(rec.Uid)
         if has == true then
-            done("스틸 성공! " .. tag .. " 내 기지 확인됨", true)
+            done(T("스틸 성공! ", "Steal success! ") .. tag .. T(" 내 기지 확인됨", " confirmed at home"), true)
         elseif has == false then
-            done("귀환 완료. " .. tag .. " 배치 미확인 - 직접 확인해줘", true)
+            done(T("귀환 완료. ", "Returned. ") .. tag .. T(" 배치 미확인 - 직접 확인해줘", " placement unconfirmed - check manually"), true)
         else
-            done("귀환 완료. " .. tag .. " (확인 불가)", true)
+            done(T("귀환 완료. ", "Returned. ") .. tag .. T(" (확인 불가)", " (unverifiable)"), true)
         end
     end)
 end
@@ -1036,7 +1251,7 @@ end
 -- 0.5초마다 도는 상태머신 (긴 작업은 StealEggDoSteal 안 spawn으로)
 local function StealFastTick()
     EnsureCarryListener()
-    if SE.phase == "idle" and Config.AutoSteal and not SE.busy then
+    if SE.phase == "idle" and Config.AutoSteal and not SE.busy and not Config.SafeMode then
         local best = PickBestEgg()
         if best then StealEggDoSteal(best, true) end
     end
@@ -1096,13 +1311,13 @@ local function HookDeathLog(ch)
                 local hrp2 = ch:FindFirstChild("HumanoidRootPart")
                 local st = getgenv().StealEgg
                 local last = st and st.lastDeath
-                info = string.format("위치 %s | 단계 %s | 앵커 %s",
+                info = string.format(T("위치 %s | 단계 %s | 앵커 %s", "pos %s | phase %s | anchored %s"),
                     hrp2 and string.format("%.0f,%.0f,%.0f", hrp2.Position.X, hrp2.Position.Y, hrp2.Position.Z) or "?",
                     (last and (last.stage .. "/" .. last.time)) or ((st and st.phase) or "?"),
                     hrp2 and tostring(hrp2.Anchored) or "?")
             end)
-            Notify("사망 감지", info, 5)
-            print("[StealEgg] 사망 " .. info)
+            Notify(T("사망 감지", "Death detected"), info, 5)
+            print("[StealEgg] " .. T("사망 ", "died ") .. info)
         end)
     end)
 end
@@ -1117,7 +1332,7 @@ task.spawn(function()
         task.wait(0.5)
         if not getgenv().StealEggStock_Loaded then break end
         pcall(StealFastTick)
-        local slowSec = math.max(3, tonumber(Config.RefreshSec) or 5)
+        local slowSec = math.max(3, tonumber(Config.RefreshSec) or 5) + math.random() * 1.5
         if Config.AutoRefresh and os.clock() - lastSlow >= slowSec then
             lastSlow = os.clock()
             -- TP/귀환 작업 중에는 스톡 갱신으로 상태창 덮지 않기
@@ -1128,5 +1343,10 @@ task.spawn(function()
     end
 end)
 
-Notify("StealEgg Stock v1.6", "로드됨. RightShift 토글 / 안전착지", 4)
-print("[StealEggStock v1.6] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
+Notify("StealEgg Stock v1.8", T("로드됨. RightShift 토글 / 세이프모드", "Loaded. RightShift toggles / safe mode"), 4)
+if Config.SafeMode then
+    task.delay(1.5, function()
+        Notify(T("⚠️ 세이프 모드 ON", "⚠️ Safe mode ON"), T("BAC 킥 후 보호 중: TP/스틸 차단됨. 스톡/ESP만 사용돼. 해제은 업데이트 탭 (밴 위험!)", "Protecting after BAC kick: TP/steal blocked. Stock/ESP only. Disable in Updates tab (ban risk!)"), 6)
+    end)
+end
+print("[StealEggStock v1.8] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
