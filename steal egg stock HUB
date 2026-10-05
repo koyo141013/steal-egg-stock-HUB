@@ -6,6 +6,7 @@
 -- v1.3: TP 중 사망 수정 (전구간 앵커 + 바닥확인 + 실패시 출발지 복귀)
 -- v1.4: 자동스틸 귀환 (알 줍기 감지 → 내 기지로 TP)
 -- v1.5: 스틸 시퀀스 단순화 (알 TP → E 3초 홀드 → 기지 귀환), 오감지/TP충돌 수정
+-- v1.6: 이동 중 사망 수정 (겹침 없는 착지점 + 착지 감시/구조 + 사망 원인 기록)
 
 if getgenv().StealEggStock_Loaded then
     pcall(function() getgenv().StealEggStock_Cleanup() end)
@@ -47,7 +48,8 @@ getgenv().StealEggConfig = getgenv().StealEggConfig or {
     TPGroundWait = 3, -- 해제 전 바닥 로딩 대기(초)
     TPSafeReturn = true, -- 바닥 없으면 출발지로 복귀
     AutoFireE = true, -- 자동스틸: 알 앞에 가면 E(줍기 프롬프트) 자동발동 시도
-    CarryTimeout = 25, -- 알 앞에서 E 대기 시간(초)
+    CarryTimeout = 25, -- (v1.5부터 미사용, 호환용)
+    EHoldSec = 3, -- E 홀드 시간(초, 프롬프트 요구 1.2초 + 여유)
 }
 local Config = getgenv().StealEggConfig
 
@@ -183,6 +185,38 @@ local function HasGroundBelow(pos, char)
     return ok and hit ~= nil
 end
 
+-- v1.6 겹침 없는 착지점: 바닥 위 + 캐릭터 크기만큼 빈 공간 확인
+local function FindSafeSpot(pos, char)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { char }
+    params.IgnoreWater = true
+    local hit
+    pcall(function()
+        hit = Workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -80, 0), params)
+    end)
+    local baseY = hit and (hit.Position.Y + 4.5) or pos.Y
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Exclude
+    op.FilterDescendantsInstances = { char }
+    op.MaxParts = 20
+    -- 바닥부터 위로 30까지 첫 빈 자리 탐색
+    for lift = 0, 30, 3 do
+        local cand = Vector3.new(pos.X, baseY + lift, pos.Z)
+        local blocked = false
+        pcall(function()
+            local parts = Workspace:GetPartBoundsInBox(CFrame.new(cand), Vector3.new(4, 6, 3), op)
+            for _, p in ipairs(parts) do
+                if p.CanCollide then blocked = true break end
+            end
+        end)
+        if not blocked then
+            return CFrame.new(cand), cand
+        end
+    end
+    return CFrame.new(pos.X, baseY + 30, pos.Z), Vector3.new(pos.X, baseY + 30, pos.Z)
+end
+
 local function RestoreChar(char, hrp, hum)
     pcall(function() hrp.Anchored = false end)
     SetCharCollide(char, true)
@@ -216,11 +250,25 @@ local function TeleportToInner(cf, opts)
     local targetPos = cf.Position + Vector3.new(0, alt, 0)
     local targetCF = CFrame.new(targetPos)
 
-    -- 사망 감지 (이동 중 죽으면 즉시 실패 처리)
+    -- 사망 감지 + v1.6 사망 원인 기록 (앵커 상태면 서버킬 의심)
+    local stage = "준비"
     local died = false
     local diedConn
     pcall(function()
-        diedConn = hum.Died:Connect(function() died = true end)
+        diedConn = hum.Died:Connect(function()
+            died = true
+            pcall(function()
+                local st = getgenv().StealEgg
+                if st then
+                    st.lastDeath = {
+                        time = os.date("%H:%M:%S"),
+                        stage = stage,
+                        anchored = tostring(hrp and hrp.Parent and hrp.Anchored),
+                        pos = hrp and hrp.Parent and string.format("%.0f,%.0f,%.0f", hrp.Position.X, hrp.Position.Y, hrp.Position.Z) or "?",
+                    }
+                end
+            end)
+        end)
     end)
 
     local function cleanupConn()
@@ -238,6 +286,7 @@ local function TeleportToInner(cf, opts)
         end
 
         -- 1) 충돌 OFF + 즉시 앵커 (이 시점부터 추락 불가)
+        stage = "이동준비"
         pcall(function()
             hum.Sit = false
             hum:ChangeState(Enum.HumanoidStateType.GettingUp)
@@ -254,6 +303,7 @@ local function TeleportToInner(cf, opts)
 
         local t0 = os.clock()
         -- 3) 앵커 상태로 단계별 이동 (빈 청크 통과해도 추락사 없음)
+        stage = "이동중"
         local aborted = false
         while getgenv().StealEggStock_Loaded and not died do
             if not hrp.Parent then aborted = true break end
@@ -273,6 +323,7 @@ local function TeleportToInner(cf, opts)
         HardSet(hrp, targetCF)
 
         -- 4) 앵커 홀드: 서버 Correction이 와도 안 끌려감
+        stage = "고정홀드"
         local holdUntil = os.clock() + holdTime
         while os.clock() < holdUntil and not died do
             if not hrp.Parent then break end
@@ -286,6 +337,7 @@ local function TeleportToInner(cf, opts)
         end
 
         -- 5) 바닥 확인: 로딩 안 된 허공이면 해제하지 말고 대기/복귀 (추락사 방지)
+        stage = "바닥확인"
         local waited = 0
         while waited < groundWait and not HasGroundBelow(targetPos, char) do
             pcall(function() LocalPlayer:RequestStreamAroundAsync(targetPos, 2) end)
@@ -304,11 +356,18 @@ local function TeleportToInner(cf, opts)
             -- 복귀 OFF면 그래도 해제 (사용자 선택)
         end
 
-        -- 6) 고정 해제 + 복구 + 최종 스냅
+        -- 6) v1.6 겹침 없는 착지점 계산 후 앵커 상태로 미리 안착
+        stage = "착지점계산"
+        local safeCF, safePos = FindSafeSpot(targetPos, char)
+        HardSet(hrp, safeCF)
+        task.wait(0.2)
+
+        -- 7) 고정 해제 + 복구 + 최종 스냅
+        stage = "해제"
         RestoreChar(char, hrp, hum)
         for i = 1, 4 do
             if not hrp.Parent or died then break end
-            HardSet(hrp, targetCF)
+            HardSet(hrp, safeCF)
             task.wait(0.08)
         end
         task.wait(0.3)
@@ -316,7 +375,39 @@ local function TeleportToInner(cf, opts)
             cleanupConn()
             return false, math.huge, "착지 중 사망/리스폰됨"
         end
-        local finalDist = (hrp.Position - targetPos).Magnitude
+
+        -- 8) v1.6 착지 감시 1.5초: 허공 추락/튕김 캐치 → 안전지점으로 구조
+        stage = "착지감시"
+        local watchUntil = os.clock() + 1.5
+        local unstable = nil
+        while os.clock() < watchUntil and not died do
+            if not hrp.Parent then break end
+            local spd = 0
+            pcall(function() spd = hrp.AssemblyLinearVelocity.Magnitude end)
+            if hrp.Position.Y < safePos.Y - 30 then
+                unstable = "허공 추락 감지"
+                break
+            end
+            if spd > 250 then
+                unstable = "튕김 감지"
+                break
+            end
+            RunService.Heartbeat:Wait()
+        end
+        if unstable and not died and hrp.Parent then
+            -- Status는 GUI 영역 local이라 여기서 직접 못 씀. pcall로 안전하게만 시도.
+            pcall(function() Status.Text = unstable .. " → 안전지점으로 구조 중..." end)
+            pcall(function() hrp.Anchored = true end)
+            HardSet(hrp, safeCF)
+            task.wait(0.3)
+            RestoreChar(char, hrp, hum)
+            task.wait(0.4)
+        end
+        if died or not hrp.Parent then
+            cleanupConn()
+            return false, math.huge, "착지 중 사망/리스폰됨"
+        end
+        local finalDist = (hrp.Position - safePos).Magnitude
         if finalDist <= tolerance then
             cleanupConn()
             return true, finalDist, string.format("도착 (%.1f stud, %d회차)", finalDist, attempt)
@@ -413,7 +504,7 @@ local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, -60, 0, 30)
 Title.Position = UDim2.new(0, 10, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "🥚 Steal an Egg - Stock v1.5"
+Title.Text = "🥚 Steal an Egg - Stock v1.6"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 15
@@ -912,9 +1003,10 @@ function StealEggDoSteal(rec, isAuto)
             local pr = FindCarryPrompt(rec.BottomCFrame.Position)
             if pr then pcall(function() FireCarryPrompt(pr) end) end
         end
-        -- 3) E 3초 홀드
-        Status.Text = tag .. " 앞에서 E 홀드 중... (3초)"
-        local _, msgH = HoldE(3)
+        -- 3) E 홀드 (프롬프트 1.2초 + 여유)
+        local holdSec = tonumber(Config.EHoldSec) or 3
+        Status.Text = tag .. " 앞에서 E 홀드 중... (" .. tostring(holdSec) .. "초)"
+        local _, msgH = HoldE(holdSec)
         Status.Text = tag .. " " .. tostring(msgH) .. " → 기지로 복귀"
         task.wait(0.3)
         -- 4) 기지로 귀환
@@ -991,6 +1083,32 @@ table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp
     end
 end))
 
+-- v1.6 사망 로거: 언제/어디서/무슨 단계에서 죽었는지 기록 (원인 판별용)
+-- 앵커 상태에서 죽으면 = 서버킬 의심 / 추락이면 = 물리 문제
+local function HookDeathLog(ch)
+    task.spawn(function()
+        local hum
+        pcall(function() hum = ch:WaitForChild("Humanoid", 10) end)
+        if not hum then return end
+        hum.Died:Connect(function()
+            local info = ""
+            pcall(function()
+                local hrp2 = ch:FindFirstChild("HumanoidRootPart")
+                local st = getgenv().StealEgg
+                local last = st and st.lastDeath
+                info = string.format("위치 %s | 단계 %s | 앵커 %s",
+                    hrp2 and string.format("%.0f,%.0f,%.0f", hrp2.Position.X, hrp2.Position.Y, hrp2.Position.Z) or "?",
+                    (last and (last.stage .. "/" .. last.time)) or ((st and st.phase) or "?"),
+                    hrp2 and tostring(hrp2.Anchored) or "?")
+            end)
+            Notify("사망 감지", info, 5)
+            print("[StealEgg] 사망 " .. info)
+        end)
+    end)
+end
+table.insert(Connections, LocalPlayer.CharacterAdded:Connect(HookDeathLog))
+if LocalPlayer.Character then HookDeathLog(LocalPlayer.Character) end
+
 -- 메인 루프 (0.5초 상태머신 + 주기적 스톡 갱신)
 task.spawn(function()
     DoFetch(false)
@@ -1010,5 +1128,5 @@ task.spawn(function()
     end
 end)
 
-Notify("StealEgg Stock v1.5", "로드됨. RightShift 토글 / E3초후 귀환", 4)
-print("[StealEggStock v1.5] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
+Notify("StealEgg Stock v1.6", "로드됨. RightShift 토글 / 안전착지", 4)
+print("[StealEggStock v1.6] loaded. Records fetch via EggWorld.AskFieldEggSnapshot")
